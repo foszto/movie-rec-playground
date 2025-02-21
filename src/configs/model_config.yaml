@@ -7,7 +7,7 @@ early_stopping_patience: 5
 
 # Model parameters
 model_params:
-  n_factors: 80
+  n_factors: 60
   learning_rate: 0.0005
   dropout: 0.3
   weight_decay: 0.01
@@ -18,7 +18,7 @@ model_params:
 llm_params:
   provider: "sentence_transformers"
   model_name: "all-MiniLM-L6-v2"
-  embedding_dim: 128
+  embedding_dim: 64
   use_cached_embeddings: true
   
 # Evaluation parameters

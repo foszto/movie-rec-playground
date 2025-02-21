@@ -19,7 +19,7 @@ class HybridNet(nn.Module):
                  n_users: int,
                  n_items: int,
                  n_factors: int = 80,
-                 llm_dim: int = 128,
+                 llm_dim: int = 64,
                  dropout: float = 0.4):
         """
         Initialize the hybrid neural network.
@@ -391,6 +391,10 @@ class HybridRecommender:
                 valid_data['movie_info_dict'],
                 valid_data['user_history_dict']
             )
+            logging.info(f"Validation loss: {val_metrics['val_loss']:.4f}")
+            logging.info(f"Validation MAE: {val_metrics['val_mae']:.4f}")
+            logging.info(f"Validation RMSE: {val_metrics['val_rmse']:.4f}")
+            logging.info(f"Training loss: {metrics['train_loss']:.4f}")
             metrics.update(val_metrics)
         
         self.history.append(metrics)

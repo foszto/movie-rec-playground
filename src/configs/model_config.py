@@ -49,7 +49,7 @@ class HybridConfig(ModelConfig):
     llm_provider: str = "sentence_transformers"
     llm_model_name: str = "all-MiniLM-L6-v2"
     llm_api_key: Optional[str] = None
-    llm_embedding_dim: int = 128
+    llm_embedding_dim: int = 64
     use_cached_embeddings: bool = True
     
     def __post_init__(self):

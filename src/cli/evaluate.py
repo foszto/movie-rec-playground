@@ -36,7 +36,7 @@ async def evaluate(data_dir: str, model_path: str, output_dir: str):
         # Create test dataset
         test_dataset = MovieLensDataset(ratings_df)
         test_data = {
-            'dataloader': test_dataset.get_dataloader(batch_size=128, shuffle=False),
+            'dataloader': test_dataset.get_dataloader(batch_size=64, shuffle=False),
             'movie_info_dict': movie_info_dict,
             'user_history_dict': user_history_dict
         }

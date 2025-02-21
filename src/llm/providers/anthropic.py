@@ -12,7 +12,7 @@ class AnthropicProvider(BaseLLMProvider):
                  model_name: str = "claude-3-haiku-20240307"):
         self.client = Anthropic(api_key=api_key)
         self.model_name = model_name
-        self.embedding_dim = 384
+        self.embedding_dim = 64
         self.logger = logging.getLogger(self.__class__.__name__)
     
     async def get_embedding(self, text: str) -> torch.Tensor:
