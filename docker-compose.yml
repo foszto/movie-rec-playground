@@ -1,15 +1,21 @@
 version: '3.8'
 
 services:
-  jupyter:
+
+  api:
     build: .
     ports:
-      - "8888:8888"
+      - "${API_PORT}:${API_PORT}"
     volumes:
       - .:/app
     environment:
-      - JUPYTER_ENABLE_LAB=yes
-      - PYTHONPATH=/app
+      - PYTHONPATH=${PYTHONPATH}
+      - DEBUG=${DEBUG}
+      - MODEL_PATH=${MODEL_PATH}
+      - DATA_DIR=${DATA_DIR}
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
+    env_file:
+      - .env
     deploy:
       resources:
         reservations:
@@ -17,15 +23,34 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+    command: uvicorn app:app --host ${API_HOST} --port ${API_PORT} --reload
+
+  frontend:
+    image: node:18-alpine
+    ports:
+      - "${PORT}:${PORT}"
+    volumes:
+      - ./frontend:/app
+    working_dir: /app
+    environment:
+      - REACT_APP_API_URL=${REACT_APP_API_URL}
+      - PORT=${PORT}
+    env_file:
+      - .env
     command: >
-      bash -c "jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token=''"
+      sh -c "npm install && npm start"
+    depends_on:
+      - api
 
   dev:
     build: .
     volumes:
       - .:/app
     environment:
-      - PYTHONPATH=/app
+      - PYTHONPATH=${PYTHONPATH}
+      - DEBUG=${DEBUG}
+    env_file:
+      - .env
     deploy:
       resources:
         reservations:
@@ -33,4 +58,4 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    command: tail -f /dev/null  # Keeps container running for development
+    command: tail -f /dev/null

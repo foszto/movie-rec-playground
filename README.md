@@ -77,21 +77,21 @@ The project includes the Food.com dataset with:
 
    ```bash
    docker-compose exec dev bash
-   python main.py train --data-dir data/processed --output-dir output --config-path src/configs/model_config.yaml
+   python main.py train --data-dir data/processed --output-dir models --config-path src/configs/model_config.yaml
    ```
 
 ## Evaluate
 
    ```bash
    docker-compose exec dev bash
-   python main.py evaluate
+   python main.py evaluate --data-dir data/processed --model-path models --output-dir output
    ```
 
 ## Recommend
 
    ```bash
    docker-compose exec dev bash
-   python main.py recommend
+   python main.py recommend --data-dir data/processed --model-path output/final_model.pt --user-id 101 --include-watched
    ```
 ## License
 
