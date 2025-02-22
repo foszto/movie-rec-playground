@@ -1,8 +1,8 @@
 # Training parameters
 random_seed: 42
 valid_ratio: 0.2
-batch_size: 64
-n_epochs: 1
+batch_size: 32
+n_epochs: 3
 early_stopping_patience: 2
 
 # Model parameters

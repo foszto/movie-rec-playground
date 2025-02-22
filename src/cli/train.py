@@ -5,6 +5,7 @@ import logging
 import yaml
 from pathlib import Path
 import asyncio
+import torch.multiprocessing as mp
 from src.configs.logging_config import setup_logging
 from src.configs.model_config import HybridConfig
 from src.data.dataset import MovieLensDataset
@@ -12,8 +13,11 @@ from src.models.hybrid import HybridRecommender
 from src.utils.data_io import load_preprocessed_data
 from src.utils.visualization import plot_training_history
 
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# Set multiprocessing start method
+mp.set_start_method('spawn', force=True)
 
+# Disable tokenizers parallelism
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 @click.command()
 @click.option('--data-dir', type=click.Path(exists=True), required=True,
@@ -54,8 +58,14 @@ def train(data_dir: str, output_dir: str, config_path: str):
         
         model = HybridRecommender(model_config)
         
+        # Módosított DataLoader konfigurációk
         train_data = {
-            'dataloader': train_dataset.get_dataloader(batch_size=config.get('batch_size', 64)),
+            'dataloader': train_dataset.get_dataloader(
+                batch_size=config.get('batch_size', 32),
+                num_workers=0,  # Single process először
+                pin_memory=True,
+                persistent_workers=False
+            ),
             'movie_info_dict': movie_info_dict,
             'user_history_dict': user_history_dict,
             'user_tags_dict': user_tags_dict,
@@ -63,7 +73,12 @@ def train(data_dir: str, output_dir: str, config_path: str):
         }
         
         valid_data = {
-            'dataloader': valid_dataset.get_dataloader(batch_size=config.get('batch_size', 64)),
+            'dataloader': valid_dataset.get_dataloader(
+                batch_size=config.get('batch_size', 32),
+                num_workers=0,  # Single process először
+                pin_memory=True,
+                persistent_workers=False
+            ),
             'movie_info_dict': movie_info_dict,
             'user_history_dict': user_history_dict,
             'user_tags_dict': user_tags_dict,

@@ -23,8 +23,6 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install JupyterLab
-RUN pip install --no-cache-dir jupyterlab
 
 # Set Python path
 ENV PYTHONPATH=/app
@@ -35,6 +33,3 @@ COPY . .
 
 # Create necessary directories
 RUN mkdir -p /app/data/raw /app/data/processed
-
-# Default command (can be overridden in docker-compose)
-CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root"]

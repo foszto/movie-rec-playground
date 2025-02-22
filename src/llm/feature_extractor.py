@@ -9,6 +9,8 @@ import logging
 from sentence_transformers import SentenceTransformer
 import torch.nn.functional as F
 
+from src.llm.genre_feature_processor import OptimizedGenreProcessor
+
 class LLMFeatureExtractor:
     """Extract features from movie descriptions and user preferences using LLM."""
     
@@ -46,6 +48,8 @@ class LLMFeatureExtractor:
             dropout=0.1,
             batch_first=True
         ).to(device)
+
+        self.genre_processor = OptimizedGenreProcessor()
     
     async def process_user_tags(self, user_tags: pd.DataFrame) -> torch.Tensor:
         """Process user tags to create tag-based user profile."""
@@ -125,39 +129,6 @@ class LLMFeatureExtractor:
         # Weighted sum of tag embeddings
         tag_profile = (attended_tags.squeeze(0) * tag_importance.unsqueeze(1)).sum(0)
         return F.normalize(tag_profile, p=2, dim=0)
-    
-    async def _get_base_user_embedding(self, user_history: pd.DataFrame) -> torch.Tensor:
-        """Generate base user embedding from rating history."""
-        # Create user profile text
-        top_movies = user_history[user_history['rating'] >= 4.0]['title'].tolist()[:5]
-        genres = []
-        for genre_list in user_history[user_history['rating'] >= 4.0]['genres']:
-            if isinstance(genre_list, list):
-                genres.extend(genre_list)
-        favorite_genres = pd.Series(genres).value_counts().head(3).index.tolist()
-        
-        profile_text = f"""
-        User preferences:
-        Top rated movies: {', '.join(top_movies) if top_movies else 'None'}
-        Favorite genres: {', '.join(favorite_genres) if favorite_genres else 'None'}
-        Total ratings: {len(user_history)}
-        Average rating: {user_history['rating'].mean():.2f}
-        """
-        
-        # Get embedding
-        try:
-            embedding = self.model.encode(profile_text, convert_to_tensor=True)
-            embedding = self.projection(embedding)
-            embedding = F.normalize(embedding, p=2, dim=0)
-            
-            if self.device:
-                embedding = embedding.to(self.device)
-            
-            return embedding.detach()
-            
-        except Exception as e:
-            self.logger.error(f"Error generating user embedding: {str(e)}")
-            return torch.randn(self.embedding_dim, device=self.device)
 
     async def get_user_preference_embedding(self, 
                                          user_history: pd.DataFrame,
@@ -175,39 +146,81 @@ class LLMFeatureExtractor:
         
         return base_embedding
     
+    async def _get_base_user_embedding(self, user_history: pd.DataFrame) -> torch.Tensor:
+        """Generate base user embedding with optimized genre processing."""
+        # Check cache
+        cache_key = f"user_{len(user_history)}_{user_history['timestamp'].max()}_{user_history['rating'].mean()}"
+        if cache_key in self.embedding_cache:
+            return self.embedding_cache[cache_key]
+        
+        # Get genre preferences
+        genre_preferences = self.genre_processor.get_genre_preferences(user_history)
+        genre_text = self.genre_processor.generate_genre_feature_text(genre_preferences)
+        
+        # Get basic viewing stats - only calculate what's needed
+        profile_text = f"""
+        {genre_text}
+        Total ratings: {len(user_history)}
+        Average rating: {user_history['rating'].mean():.2f}
+        """
+        
+        # Get embedding
+        try:
+            with torch.no_grad():
+                embedding = self.model.encode(profile_text, convert_to_tensor=True)
+                embedding = self.projection(embedding)
+                embedding = F.normalize(embedding, p=2, dim=0)
+                
+                if self.device:
+                    embedding = embedding.to(self.device)
+                
+                # Cache the result
+                self.embedding_cache[cache_key] = embedding
+                return embedding
+                
+        except Exception as e:
+            self.logger.error(f"Error generating user embedding: {str(e)}")
+            return torch.randn(self.embedding_dim, device=self.device)
+
     async def _get_base_movie_embedding(self, movie_info: Dict) -> torch.Tensor:
-        """Generate base movie embedding from movie information."""
-        # Create movie description text
-        title = movie_info.get('title', 'Unknown Title')
+        """Generate base movie embedding with minimal processing."""
+        # Create cache key from movie info
+        cache_key = f"movie_{movie_info.get('id', '')}_{movie_info.get('title', '')}"
+        if cache_key in self.embedding_cache:
+            return self.embedding_cache[cache_key]
+        
+        # Extract movie genres
         genres = movie_info.get('genres', [])
         if isinstance(genres, str):
             genres = [g.strip() for g in genres.split('|')]
         elif not isinstance(genres, list):
             genres = []
             
-        description = movie_info.get('description', '')
-        
+        # Create concise text representation
         movie_text = f"""
-        Title: {title}
+        Title: {movie_info.get('title', 'Unknown Title')}
         Genres: {', '.join(genres)}
-        Description: {description}
+        Description: {movie_info.get('description', '')}
         """
         
         # Get embedding
         try:
-            embedding = self.model.encode(movie_text, convert_to_tensor=True)
-            embedding = self.projection(embedding)
-            embedding = F.normalize(embedding, p=2, dim=0)
-            
-            if self.device:
-                embedding = embedding.to(self.device)
-            
-            return embedding.detach()
-            
+            with torch.no_grad():
+                embedding = self.model.encode(movie_text, convert_to_tensor=True)
+                embedding = self.projection(embedding)
+                embedding = F.normalize(embedding, p=2, dim=0)
+                
+                if self.device:
+                    embedding = embedding.to(self.device)
+                
+                # Cache the result
+                self.embedding_cache[cache_key] = embedding
+                return embedding
+                
         except Exception as e:
             self.logger.error(f"Error generating movie embedding: {str(e)}")
             return torch.randn(self.embedding_dim, device=self.device)
-
+            
     async def get_movie_embedding(self, 
                                 movie_info: Dict,
                                 movie_tags: Optional[pd.DataFrame] = None) -> torch.Tensor:
@@ -225,6 +238,9 @@ class LLMFeatureExtractor:
         return base_embedding
     
     def clear_cache(self):
-        """Clear the embedding cache."""
+        """Clear all caches."""
         self.embedding_cache.clear()
-        self.logger.info("Embedding cache cleared")
+        self.genre_processor.genre_cache.clear()
+        self.genre_processor.similarity_cache.clear()
+        self.genre_processor.cache_key = None
+        self.logger.info("All caches cleared")

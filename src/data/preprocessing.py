@@ -5,6 +5,8 @@ from typing import Dict, List, Tuple, Optional
 from sklearn.preprocessing import LabelEncoder
 import logging
 from pathlib import Path
+import torch
+
 
 class MovieLensPreprocessor:
     """Preprocess MovieLens dataset with detailed logging and error handling."""
@@ -13,6 +15,7 @@ class MovieLensPreprocessor:
         self.min_user_ratings = min_user_ratings
         self.min_movie_ratings = min_movie_ratings
         self.min_tags_per_item = min_tags_per_item
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
         # Setup logging
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -135,130 +138,158 @@ class MovieLensPreprocessor:
             self.logger.error(f"Error during preprocessing: {str(e)}", exc_info=True)
             raise
 
-    def preprocess_tags(self, tags_df: pd.DataFrame) -> pd.DataFrame:
-        """Process and clean tags data using batch processing."""
-        self.logger.info("Processing tags data...")
+    def _parallel_process_tags(self, movie_tags: pd.DataFrame) -> pd.DataFrame:
+        """Process tags for a single movie with memory efficiency."""
+        if len(movie_tags) == 0:
+            return pd.DataFrame()
         
-        # Alapvető típuskonverzió és tisztítás
-        tags_df = tags_df.astype({
-            'userId': np.int64,
-            'movieId': np.int64,
-            'tag': str,
-            'timestamp': np.int64
-        })
-        
-        # Először szűrjük a tag-eket a valid user és movie ID-kra
-        valid_user_ids = set(self.user_encoder.classes_)
-        valid_movie_ids = set(self.movie_encoder.classes_)
-        
-        # Szűrés valid ID-kra
-        tags_df = tags_df[
-            (tags_df['userId'].isin(valid_user_ids)) & 
-            (tags_df['movieId'].isin(valid_movie_ids))
-        ]
-        
-        if len(tags_df) == 0:
-            self.logger.warning("No valid tags found after filtering.")
-            return pd.DataFrame(columns=['userId', 'movieId', 'tag', 'timestamp', 'weight'])
-        
-        # Tag tisztítás
-        tags_df['tag'] = tags_df['tag'].str.lower().str.strip()
-        initial_size = len(tags_df)
-        
-        # Ritka tagek szűrése
-        self.logger.info("Filtering rare tags...")
-        tag_counts = tags_df['tag'].value_counts()
-        common_tags = tag_counts[tag_counts >= 2].index
-        tags_df = tags_df[tags_df['tag'].isin(common_tags)]
-        
-        # Időbélyeg normalizálás
-        self.logger.info("Normalizing timestamps...")
-        min_timestamp = tags_df['timestamp'].min()
-        max_timestamp = tags_df['timestamp'].max()
-        timestamp_range = max_timestamp - min_timestamp
-        tags_df['timestamp_norm'] = (tags_df['timestamp'] - min_timestamp) / timestamp_range if timestamp_range > 0 else 0
-        
-        # ID konverzió
-        self.logger.info("Converting IDs...")
         try:
-            tags_df['userId'] = self.user_encoder.transform(tags_df['userId'])
-            tags_df['movieId'] = self.movie_encoder.transform(tags_df['movieId'])
-        except ValueError as e:
-            self.logger.error(f"Error during ID conversion: {str(e)}")
-            # Debug információ
-            invalid_users = set(tags_df['userId'].unique()) - valid_user_ids
-            invalid_movies = set(tags_df['movieId'].unique()) - valid_movie_ids
-            if invalid_users:
-                self.logger.debug(f"Invalid user IDs found: {invalid_users}")
-            if invalid_movies:
-                self.logger.debug(f"Invalid movie IDs found: {invalid_movies}")
-            raise
-        
-        # Batch feldolgozás
-        self.logger.info("Processing tags in batches...")
-        processed_dfs = []
-        total_movies = len(tags_df['movieId'].unique())
-        
-        for idx, movie_id in enumerate(tags_df['movieId'].unique()):
-            if idx % 100 == 0:
-                self.logger.info(f"Processing movie {idx}/{total_movies}")
-                
-            movie_tags = tags_df[tags_df['movieId'] == movie_id].copy()
+            # Select only needed columns
+            movie_tags = movie_tags[['userId', 'movieId', 'tag', 'timestamp']].copy()
             
-            if len(movie_tags) == 0:
-                continue
-                
-            # Calculate importance
+            # Convert to GPU tensors for faster computation
+            timestamps = torch.tensor(movie_tags['timestamp'].values, dtype=torch.float32).to(self.device)
+            
+            # Normalize timestamps on GPU
+            min_timestamp = timestamps.min()
+            max_timestamp = timestamps.max()
+            timestamp_range = max_timestamp - min_timestamp
+            timestamp_norm = (timestamps - min_timestamp) / timestamp_range if timestamp_range > 0 else torch.zeros_like(timestamps)
+            
+            # Calculate importance on CPU efficiently
             tag_user_counts = movie_tags.groupby('tag')['userId'].nunique()
-            movie_tags['importance'] = 1.0
-            movie_tags.loc[movie_tags['tag'].isin(tag_user_counts[tag_user_counts >= 3].index), 'importance'] = 1.5
+            popular_tags = set(tag_user_counts[tag_user_counts >= 3].index)
+            importance_array = np.ones(len(movie_tags))
+            importance_array[movie_tags['tag'].isin(popular_tags)] = 1.5
             
-            # Calculate weight
-            movie_tags['weight'] = movie_tags['importance'] * (1 + 0.5 * movie_tags['timestamp_norm'])
+            # Convert to GPU for weight calculation
+            importance = torch.tensor(importance_array, dtype=torch.float32).to(self.device)
+            weights = importance * (1 + 0.5 * timestamp_norm)
             
-            # Keep only most relevant
-            movie_tags = movie_tags.sort_values(['weight', 'timestamp'], ascending=[False, False])
-            movie_tags = movie_tags.drop_duplicates(['userId', 'movieId', 'tag'], keep='first')
+            # Move results back to CPU and update DataFrame
+            movie_tags['timestamp_norm'] = timestamp_norm.cpu().numpy()
+            movie_tags['importance'] = importance.cpu().numpy()
+            movie_tags['weight'] = weights.cpu().numpy()
             
-            processed_dfs.append(movie_tags[['userId', 'movieId', 'tag', 'timestamp', 'weight']])
-        
-        # Final combination
-        if processed_dfs:
-            tags_df = pd.concat(processed_dfs, ignore_index=True)
-        else:
-            tags_df = pd.DataFrame(columns=['userId', 'movieId', 'tag', 'timestamp', 'weight'])
-        
-        self.logger.info(f"Tag processing complete: {len(tags_df)} tags for {len(tags_df['movieId'].unique())} movies")
-        return tags_df
-
+            # Clean up GPU memory
+            del timestamps, importance, weights
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            return movie_tags[['userId', 'movieId', 'tag', 'timestamp', 'weight']]
+            
+        except Exception as e:
+            self.logger.error(f"Error in _parallel_process_tags: {str(e)}", exc_info=True)
+            raise
+    
     def create_tag_dictionaries(self, tags_df: pd.DataFrame) -> Tuple[Dict, Dict]:
         """Create dictionaries for user and movie tags with optimized memory usage."""
-        self.logger.info("Creating tag dictionaries...")
-        
-        # Initialize empty dictionaries
-        user_tags = {}
-        movie_tags = {}
-        
-        # Group by user and movie once
-        user_groups = dict(tuple(tags_df.groupby('userId')))
-        movie_groups = dict(tuple(tags_df.groupby('movieId')))
-        
-        # Create user dictionary
-        total_users = len(user_groups)
-        for i, (user_id, user_data) in enumerate(user_groups.items(), 1):
-            if i % 1000 == 0:
-                self.logger.info(f"Processing user tags: {i}/{total_users}")
-            user_tags[user_id] = user_data[['movieId', 'tag', 'timestamp', 'weight']].copy()
-        
-        # Create movie dictionary
-        total_movies = len(movie_groups)
-        for i, (movie_id, movie_data) in enumerate(movie_groups.items(), 1):
-            if i % 1000 == 0:
-                self.logger.info(f"Processing movie tags: {i}/{total_movies}")
-            movie_tags[movie_id] = movie_data[['userId', 'tag', 'timestamp', 'weight']].copy()
-        
-        self.logger.info(f"Created tag dictionaries for {len(user_tags)} users and {len(movie_tags)} movies")
-        return user_tags, movie_tags
+        try:
+            from tqdm import tqdm
+            self.logger.info("Creating tag dictionaries...")
+            
+            # Initialize empty dictionaries
+            user_tags = {}
+            movie_tags = {}
+            
+            # Group by user and movie once
+            user_groups = dict(tuple(tags_df.groupby('userId')))
+            movie_groups = dict(tuple(tags_df.groupby('movieId')))
+            
+            # Create user dictionary with progress bar
+            with tqdm(total=len(user_groups), desc="Processing user tags", unit="users") as pbar:
+                for user_id, user_data in user_groups.items():
+                    user_tags[user_id] = user_data[['movieId', 'tag', 'timestamp', 'weight']].copy()
+                    pbar.update(1)
+            
+            # Create movie dictionary with progress bar
+            with tqdm(total=len(movie_groups), desc="Processing movie tags", unit="movies") as pbar:
+                for movie_id, movie_data in movie_groups.items():
+                    movie_tags[movie_id] = movie_data[['userId', 'tag', 'timestamp', 'weight']].copy()
+                    pbar.update(1)
+            
+            self.logger.info(f"Created tag dictionaries for {len(user_tags)} users and {len(movie_tags)} movies")
+            return user_tags, movie_tags
+            
+        except Exception as e:
+            self.logger.error(f"Error in create_tag_dictionaries: {str(e)}", exc_info=True)
+            raise
+
+    def preprocess_tags(self, tags_df: pd.DataFrame) -> pd.DataFrame:
+        """Process and clean tags data using GPU acceleration with progress bars."""
+        try:
+            from tqdm import tqdm
+            self.logger.info("Processing tags data with GPU acceleration...")
+            
+            # Basic type conversion and cleaning
+            tags_df = tags_df.astype({
+                'userId': np.int64,
+                'movieId': np.int64,
+                'tag': str,
+                'timestamp': np.int64
+            })
+            
+            # Filter tags for valid user and movie IDs
+            valid_user_ids = set(self.user_encoder.classes_)
+            valid_movie_ids = set(self.movie_encoder.classes_)
+            
+            tags_df = tags_df[
+                (tags_df['userId'].isin(valid_user_ids)) & 
+                (tags_df['movieId'].isin(valid_movie_ids))
+            ]
+            
+            if len(tags_df) == 0:
+                self.logger.warning("No valid tags found after filtering.")
+                return pd.DataFrame(columns=['userId', 'movieId', 'tag', 'timestamp', 'weight'])
+            
+            # Clean tags
+            tags_df['tag'] = tags_df['tag'].str.lower().str.strip()
+            
+            # Filter rare tags
+            tag_counts = tags_df['tag'].value_counts()
+            common_tags = tag_counts[tag_counts >= 2].index
+            tags_df = tags_df[tags_df['tag'].isin(common_tags)]
+            
+            # Process each movie's tags in parallel using GPU
+            processed_dfs = []
+            
+            # Process in batches for better GPU utilization
+            batch_size = 100
+            unique_movies = tags_df['movieId'].unique()
+            movie_batches = np.array_split(unique_movies, max(1, len(unique_movies) // batch_size))
+            
+            # Main processing loop with progress bar
+            with tqdm(total=len(movie_batches), desc="Processing tag batches", unit="batch") as pbar:
+                for movie_batch in movie_batches:
+                    batch_tags = tags_df[tags_df['movieId'].isin(movie_batch)].copy()
+                    processed_batch = []
+                    
+                    # Inner loop for individual movies in batch
+                    for movie_id in movie_batch:
+                        movie_tags = batch_tags[batch_tags['movieId'] == movie_id].copy()
+                        processed_movie_tags = self._parallel_process_tags(movie_tags)
+                        if len(processed_movie_tags) > 0:
+                            processed_batch.append(processed_movie_tags)
+                    
+                    if processed_batch:
+                        processed_dfs.extend(processed_batch)
+                    pbar.update(1)
+            
+            # Combine results
+            if processed_dfs:
+                tags_df = pd.concat(processed_dfs, ignore_index=True)
+                tags_df = tags_df.sort_values(['movieId', 'weight', 'timestamp'], 
+                                            ascending=[True, False, False])
+                tags_df = tags_df.drop_duplicates(['userId', 'movieId', 'tag'], keep='first')
+            else:
+                tags_df = pd.DataFrame(columns=['userId', 'movieId', 'tag', 'timestamp', 'weight'])
+            
+            self.logger.info(f"Tag processing complete: {len(tags_df)} tags for {len(tags_df['movieId'].unique())} movies")
+            return tags_df[['userId', 'movieId', 'tag', 'timestamp', 'weight']]
+            
+        except Exception as e:
+            self.logger.error(f"Error in preprocess_tags: {str(e)}", exc_info=True)
+            raise
 
     def _filter_minimum_ratings(self, ratings_df: pd.DataFrame) -> pd.DataFrame:
         """Filter users and movies with minimum number of ratings."""
@@ -314,53 +345,97 @@ class MovieLensPreprocessor:
             retention = (self.stats['final_ratings'] / self.stats['initial_ratings']) * 100
             self.logger.info(f"Data retention: {retention:.2f}%")
     
-    def create_user_history_dict(self, 
-                               ratings_df: pd.DataFrame,
-                               movies_df: pd.DataFrame) -> Dict:
-        """Create dictionary of user rating histories."""
+    def create_movie_info_dict(self, movies_df: pd.DataFrame) -> Dict:
+        """Create dictionary of movie information with memory-efficient processing."""
         try:
+            from tqdm import tqdm
+            import gc
+            self.logger.info("Creating movie info dictionary...")
+            
+            # Select only needed columns
+            movies_df = movies_df[['movieId', 'title', 'genres']].copy()
+            movie_info_dict = {}
+            
+            # Process in batches
+            batch_size = 1000
+            total_movies = len(movies_df)
+            
+            with tqdm(total=total_movies, desc="Processing movies", unit="movie") as pbar:
+                for start_idx in range(0, total_movies, batch_size):
+                    end_idx = min(start_idx + batch_size, total_movies)
+                    batch_df = movies_df.iloc[start_idx:end_idx]
+                    
+                    for _, row in batch_df.iterrows():
+                        movie_info_dict[row['movieId']] = {
+                            'movieId': row['movieId'],
+                            'title': row['title'],
+                            'genres': row['genres']
+                        }
+                        pbar.update(1)
+                    
+                    # Clean up batch memory
+                    del batch_df
+                    gc.collect()
+            
+            self.logger.info(f"Created info dict for {len(movie_info_dict)} movies")
+            return movie_info_dict
+            
+        except Exception as e:
+            self.logger.error(f"Error in create_movie_info_dict: {str(e)}", exc_info=True)
+            raise
+
+
+    def create_user_history_dict(self, ratings_df: pd.DataFrame, movies_df: pd.DataFrame) -> Dict:
+        """Create dictionary of user rating histories with memory-efficient processing."""
+        try:
+            import gc
             self.logger.info("Creating user history dictionary...")
+            
+            # Optimize memory by selecting only needed columns
+            ratings_df = ratings_df[['userId', 'movieId', 'rating', 'timestamp']]
+            movies_df = movies_df[['movieId', 'title', 'genres']]
+            
+            unique_users = ratings_df['userId'].unique()
+            total_users = len(unique_users)
+            batch_size = min(100, max(1, total_users // 20))
+            
             user_histories = {}
+            processed_count = 0
             
-            # Merge ratings with movie information
-            merged_df = ratings_df.merge(movies_df, on='movieId')
-            
-            for user_id in ratings_df['userId'].unique():
-                user_ratings = merged_df[merged_df['userId'] == user_id].copy()
-                user_histories[user_id] = user_ratings
+            for start_idx in range(0, total_users, batch_size):
+                # Process users in batches
+                end_idx = min(start_idx + batch_size, total_users)
+                batch_users = unique_users[start_idx:end_idx]
                 
-                if len(user_histories) % 1000 == 0:
-                    self.logger.debug(f"Processed {len(user_histories)} users")
-            
+                # Create batch only for current users
+                batch_ratings = ratings_df[ratings_df['userId'].isin(batch_users)]
+                
+                # Process each user in the batch
+                for user_id in batch_users:
+                    user_ratings = batch_ratings[batch_ratings['userId'] == user_id]
+                    user_history = user_ratings.merge(movies_df, on='movieId', how='left')
+                    
+                    # Store only necessary columns
+                    user_histories[user_id] = user_history[
+                        ['movieId', 'rating', 'timestamp', 'title', 'genres']
+                    ]
+                    
+                    processed_count += 1
+                    
+                    # Log progress every 1000 users
+                    if processed_count % 1000 == 0:
+                        self.logger.info(
+                            f"Processed {processed_count}/{total_users} users "
+                            f"({processed_count/total_users*100:.1f}%)"
+                        )
+                
+                # Clear batch data and force garbage collection
+                del batch_ratings
+                gc.collect()
+                
             self.logger.info(f"Created histories for {len(user_histories)} users")
             return user_histories
             
         except Exception as e:
-            self.logger.error(f"Error creating user history dict: {str(e)}", exc_info=True)
-            raise
-    
-    def create_movie_info_dict(self, movies_df: pd.DataFrame) -> Dict:
-        """Create dictionary of movie information."""
-        try:
-            self.logger.info("Creating movie info dictionary...")
-            movie_info_dict = {
-                row['movieId']: {
-                    'movieId': row['movieId'],  
-                    'title': row['title'],
-                    'genres': row['genres'],
-                    'description': ''  # Could be filled from external source
-                }
-                for _, row in movies_df.iterrows()
-            }
-            
-            self.logger.info(f"Created info dict for {len(movie_info_dict)} movies")
-            # Debug log for first movie
-            if len(movie_info_dict) > 0:
-                first_movie_id = list(movie_info_dict.keys())[0]
-                self.logger.info(f"Sample movie info: {movie_info_dict[first_movie_id]}")
-            
-            return movie_info_dict
-            
-        except Exception as e:
-            self.logger.error(f"Error creating movie info dict: {str(e)}", exc_info=True)
+            self.logger.error(f"Error in create_user_history_dict: {str(e)}", exc_info=True)
             raise
