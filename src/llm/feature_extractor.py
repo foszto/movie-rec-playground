@@ -26,17 +26,16 @@ class LLMFeatureExtractor:
             device: Device to use for computations
         """
         logging.getLogger('sentence_transformers').setLevel(logging.WARNING)
-        self.model = SentenceTransformer(model_name)
+        self.model = SentenceTransformer(model_name, device=device)
         self.native_dim = native_dim
         self.embedding_dim = embedding_dim
-        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = device
 
         self.projection = nn.Linear(self.native_dim, self.embedding_dim).to(self.device)
         if device is not None:
             self.model = self.model.to(device)
         
         self.embedding_dim = embedding_dim
-        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         self.embedding_cache = {}
         self.logger = logging.getLogger(self.__class__.__name__)
         
@@ -50,6 +49,9 @@ class LLMFeatureExtractor:
     
     async def process_user_tags(self, user_tags: pd.DataFrame) -> torch.Tensor:
         """Process user tags to create tag-based user profile."""
+        self.logger.info("Processing user tags...")
+        torch.set_grad_enabled(False)
+        torch.set_default_device(self.device)
         if user_tags.empty:
             return torch.zeros(self.embedding_dim, device=self.device)
             
@@ -60,15 +62,15 @@ class LLMFeatureExtractor:
         # Get embeddings for top tags
         tag_embeddings = []
         for tag in top_tags:
-            embedding = self.model.encode(tag, convert_to_tensor=True)
+            embedding = self.model.encode(tag, convert_to_tensor=True).to(self.device)
             tag_embeddings.append(embedding)
             
         if not tag_embeddings:
             return torch.zeros(self.embedding_dim, device=self.device)
             
         # Stack and process tag embeddings
-        tag_tensor = torch.stack(tag_embeddings)
-        tag_weights = torch.softmax(torch.tensor(tag_counts[:len(tag_embeddings)]), dim=0)
+        tag_tensor = torch.stack(tag_embeddings).device(self.device)
+        tag_weights = torch.softmax(torch.tensor(tag_counts[:len(tag_embeddings)]), dim=0).device(self.device)
         
         # Project to lower dimension
         projected_tags = self.tag_embedding(tag_tensor)
@@ -86,6 +88,7 @@ class LLMFeatureExtractor:
     
     async def process_movie_tags(self, movie_tags: pd.DataFrame) -> torch.Tensor:
         """Process movie tags to create tag-based movie profile."""
+        self.logger.info("Processing movie tags...")
         if movie_tags.empty:
             return torch.zeros(self.embedding_dim, device=self.device)
         

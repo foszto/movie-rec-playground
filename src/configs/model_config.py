@@ -16,6 +16,7 @@ class ModelConfig:
     l2_reg: float = 0.01
     max_grad_norm: float = 1.0
     device: str = "cuda"  
+    mixed_precision: bool = True
 
     def __post_init__(self):
         """Validáció az inicializálás után."""

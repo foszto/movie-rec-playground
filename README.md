@@ -61,13 +61,38 @@ The project includes two services:
    ```bash
    docker-compose down
    ```
-
 ## Dataset
 
 The project includes the Food.com dataset with:
 - RAW_recipes.csv: Contains recipe details
 - RAW_interactions.csv: Contains user-recipe interactions
 
+## Preprocess
+   ```bash
+   docker-compose exec dev bash
+   python main.py preprocess --data-dir data/raw --output-dir data/processed --min-user-ratings 500 --log-file logs/preprocess_log.txt
+   ```
+
+## Train
+
+   ```bash
+   docker-compose exec dev bash
+   python main.py train --data-dir data/processed --output-dir output --config-path src/configs/model_config.yaml
+   ```
+
+## Evaluate
+
+   ```bash
+   docker-compose exec dev bash
+   python main.py evaluate
+   ```
+
+## Recommend
+
+   ```bash
+   docker-compose exec dev bash
+   python main.py recommend
+   ```
 ## License
 
 MIT

@@ -2,12 +2,12 @@
 random_seed: 42
 valid_ratio: 0.2
 batch_size: 64
-n_epochs: 10
-early_stopping_patience: 5
+n_epochs: 1
+early_stopping_patience: 2
 
 # Model parameters
 model_params:
-  n_factors: 60
+  n_factors: 80
   learning_rate: 0.0005
   dropout: 0.3
   weight_decay: 0.01
@@ -18,7 +18,7 @@ model_params:
 llm_params:
   provider: "sentence_transformers"
   model_name: "all-MiniLM-L6-v2"
-  embedding_dim: 64
+  embedding_dim: 384
   use_cached_embeddings: true
   
 # Evaluation parameters

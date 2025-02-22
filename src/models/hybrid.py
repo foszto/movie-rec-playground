@@ -4,11 +4,14 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional, Tuple, List
+from torch.serialization import add_safe_globals, safe_globals
+from typing import Any, Dict, Optional, Tuple, List
 import logging
 import asyncio
 from pathlib import Path
 import numpy as np
+
+from src.models.base import BaseModel
 from ..llm.feature_extractor import LLMFeatureExtractor
 from ..configs.model_config import HybridConfig
 
@@ -21,16 +24,6 @@ class HybridNet(nn.Module):
                  n_factors: int = 80,
                  llm_dim: int = 64,
                  dropout: float = 0.4):
-        """
-        Initialize the hybrid neural network.
-        
-        Args:
-            n_users: Number of users in the dataset
-            n_items: Number of items (movies) in the dataset
-            n_factors: Dimensionality of embedding vectors
-            llm_dim: Dimension of LLM embeddings
-            dropout: Dropout rate
-        """
         super().__init__()
         
         # Collaborative filtering embeddings
@@ -67,7 +60,7 @@ class HybridNet(nn.Module):
         
         # Fusion network
         self.fusion = nn.Sequential(
-            nn.Linear(n_factors * 4, n_factors * 2),  # 4 = CF + LLM + Attention + Element-wise
+            nn.Linear(n_factors * 4, n_factors * 2),
             nn.LayerNorm(n_factors * 2),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -82,13 +75,11 @@ class HybridNet(nn.Module):
     
     def _init_weights(self):
         """Initialize model weights."""
-        # Initialize embeddings
         nn.init.normal_(self.user_factors.weight, mean=0, std=0.01)
         nn.init.normal_(self.item_factors.weight, mean=0, std=0.01)
         nn.init.zeros_(self.user_biases.weight)
         nn.init.zeros_(self.item_biases.weight)
         
-        # Initialize projection layers
         for layer in self.llm_user_projection:
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_uniform_(layer.weight)
@@ -99,7 +90,6 @@ class HybridNet(nn.Module):
                 nn.init.xavier_uniform_(layer.weight)
                 nn.init.zeros_(layer.bias)
         
-        # Initialize fusion layers
         for layer in self.fusion:
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_uniform_(layer.weight)
@@ -110,18 +100,7 @@ class HybridNet(nn.Module):
                 item_ids: torch.Tensor,
                 user_llm_embeds: torch.Tensor,
                 item_llm_embeds: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of the hybrid model.
-        
-        Args:
-            user_ids: Tensor of user IDs
-            item_ids: Tensor of item IDs
-            user_llm_embeds: LLM embeddings for users
-            item_llm_embeds: LLM embeddings for items
-            
-        Returns:
-            Tensor of predicted ratings
-        """
+        """Forward pass of the hybrid model."""
         # Get collaborative filtering embeddings
         user_embed = self.user_factors(user_ids)
         item_embed = self.item_factors(item_ids)
@@ -172,20 +151,14 @@ class HybridNet(nn.Module):
         
         return prediction
 
-class HybridRecommender:
+class HybridRecommender(BaseModel):
     """Hybrid recommender system combining collaborative filtering with LLM features."""
     
     def __init__(self, config: HybridConfig):
-        """
-        Initialize the hybrid recommender.
+        """Initialize the hybrid recommender."""
+        super().__init__(config)
         
-        Args:
-            config: Configuration object containing model parameters
-        """
-        self.config = config
-        self.device = torch.device(config.device)
-        
-        # Initialize neural network (csak egyszer!)
+        # Initialize neural network
         self.model = HybridNet(
             n_users=config.n_users,
             n_items=config.n_items,
@@ -201,7 +174,7 @@ class HybridRecommender:
             weight_decay=config.weight_decay
         )
         
-        # Initialize LLM feature extractor
+        # Initialize feature extractor
         self.feature_extractor = LLMFeatureExtractor(
             model_name=config.llm_model_name,
             embedding_dim=config.llm_embedding_dim,
@@ -211,37 +184,63 @@ class HybridRecommender:
         # Initialize loss function
         self.criterion = nn.MSELoss()
         
+        # Initialize mixed precision scaler
+        self.scaler = torch.amp.GradScaler(self.device)
+        
+        # Feature cache
+        self.feature_cache = {}
+        
         # Setup logging
         self.logger = logging.getLogger(self.__class__.__name__)
         
-        # Training history
+        # Training history and state
         self.history = []
+        self.steps = 0
+        self.accumulation_steps = 4  # Gradient accumulation steps
     
     async def _get_batch_llm_features(self,
                                     users: torch.Tensor,
                                     items: torch.Tensor,
                                     movie_info_dict: Dict,
-                                    user_history_dict: Dict
+                                    user_history_dict: Dict,
+                                    user_tags_dict: Optional[Dict] = None,
+                                    movie_tags_dict: Optional[Dict] = None
                                     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get LLM features for a batch of users and items."""
-        # Create tasks for all embeddings
-        user_tasks = [
-            self.feature_extractor.get_user_preference_embedding(
-                user_history_dict[uid.item()]
-            )
-            for uid in users
-        ]
+        """Get LLM features for a batch of users and items with caching."""
+        user_results = []
+        item_results = []
         
-        item_tasks = [
-            self.feature_extractor.get_movie_embedding(
-                movie_info_dict[iid.item()]
-            )
-            for iid in items
-        ]
+        # Process users with caching
+        for uid in users:
+            user_id = uid.item()
+            cache_key = f"user_{user_id}"
+            
+            if cache_key in self.feature_cache:
+                user_results.append(self.feature_cache[cache_key])
+            else:
+                user_history = user_history_dict[user_id]
+                user_tags = user_tags_dict.get(user_id) if user_tags_dict else None
+                embedding = await self.feature_extractor.get_user_preference_embedding(
+                    user_history, user_tags
+                )
+                self.feature_cache[cache_key] = embedding
+                user_results.append(embedding)
         
-        # Run all tasks concurrently
-        user_results = await asyncio.gather(*user_tasks)
-        item_results = await asyncio.gather(*item_tasks)
+        # Process items with caching
+        for iid in items:
+            movie_id = iid.item()
+            cache_key = f"movie_{movie_id}"
+            
+            if cache_key in self.feature_cache:
+                item_results.append(self.feature_cache[cache_key])
+            else:
+                movie_info = movie_info_dict[movie_id]
+                movie_tags = movie_tags_dict.get(movie_id) if movie_tags_dict else None
+                embedding = await self.feature_extractor.get_movie_embedding(
+                    movie_info, movie_tags
+                )
+                self.feature_cache[cache_key] = embedding
+                item_results.append(embedding)
         
         return (
             torch.stack(user_results).to(self.device),
@@ -251,45 +250,46 @@ class HybridRecommender:
     async def train_step(self,
                         batch: Dict[str, torch.Tensor],
                         movie_info_dict: Dict,
-                        user_history_dict: Dict) -> float:
-        """Perform a single training step."""
-        self.model.train()
-        
-        # Move batch to device
+                        user_history_dict: Dict,
+                        user_tags_dict: Optional[Dict] = None,
+                        movie_tags_dict: Optional[Dict] = None) -> float:
+        """Perform a single training step with mixed precision and gradient accumulation."""
+        # Move data to device
         user_ids = batch['user_id'].to(self.device)
         item_ids = batch['item_id'].to(self.device)
         ratings = batch['rating'].to(self.device)
         
         # Get LLM features
         user_llm_embeds, item_llm_embeds = await self._get_batch_llm_features(
-            user_ids,
-            item_ids,
-            movie_info_dict,
-            user_history_dict
+            user_ids, item_ids,
+            movie_info_dict, user_history_dict,
+            user_tags_dict, movie_tags_dict
         )
         
-        # Forward pass
-        self.optimizer.zero_grad()
-        predictions = self.model(
-            user_ids,
-            item_ids,
-            user_llm_embeds,
-            item_llm_embeds
-        )
+        # Mixed precision forward pass
+        with torch.amp.autocast(self.device.type):
+            predictions = self.model(
+                user_ids,
+                item_ids,
+                user_llm_embeds,
+                item_llm_embeds
+            )
+            loss = self.criterion(predictions, ratings)
+            loss = loss / self.accumulation_steps  # Scale loss for accumulation
         
-        # Compute loss
-        loss = self.criterion(predictions, ratings)
+        # Backward pass with gradient scaling
+        self.scaler.scale(loss).backward()
         
-        # Backward pass
-        loss.backward()
+        # Update weights if accumulation is complete
+        self.steps += 1
+        if self.steps % self.accumulation_steps == 0:
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad()
         
-        # Clip gradients
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
-        
-        # Update weights
-        self.optimizer.step()
-        
-        return loss.item()
+        return loss.item() * self.accumulation_steps  # Return unscaled loss
     
     async def validate(self,
                     dataloader: torch.utils.data.DataLoader,
@@ -301,7 +301,11 @@ class HybridRecommender:
         all_predictions = []
         all_targets = []
         
-        with torch.no_grad():
+        # Clear GPU cache before validation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        with torch.no_grad(), torch.cuda.amp.autocast():
             progress_bar = tqdm(dataloader, 
                             desc="Validation batches",
                             leave=False,
@@ -332,15 +336,20 @@ class HybridRecommender:
                 all_predictions.extend(predictions.cpu().numpy())
                 all_targets.extend(ratings.cpu().numpy())
                 
-                # Frissítsük a progress bar leírását
                 progress_bar.set_description(f"Validation (loss: {loss.item():.4f})")
         
-        # Calculate additional metrics
+        # Calculate metrics
         all_predictions = np.array(all_predictions)
         all_targets = np.array(all_targets)
         
         mae = np.mean(np.abs(all_predictions - all_targets))
         rmse = np.sqrt(np.mean((all_predictions - all_targets) ** 2))
+
+        self.logger.info(f"Validation loss: {total_loss / len(dataloader):.4f}")
+        self.logger.info(f"Validation MAE: {mae:.4f}")
+        self.logger.info(f"Validation RMSE: {rmse:.4f}")
+        self.logger.info(f"Validation samples: {len(all_predictions)}")
+        self.logger.info(f"Validation batches: {len(dataloader)}")
         
         return {
             'val_loss': total_loss / len(dataloader),
@@ -351,16 +360,10 @@ class HybridRecommender:
     async def fit(self,
                 train_data: Dict,
                 valid_data: Optional[Dict] = None) -> Dict[str, float]:
-        """
-        Train the model.
+        """Train the model."""
+        # Set model to training mode at epoch start
+        self.model.train()
         
-        Args:
-            train_data: Dictionary containing training data
-            valid_data: Optional dictionary containing validation data
-        
-        Returns:
-            Dictionary of training metrics
-        """
         epoch_loss = 0
         n_batches = len(train_data['dataloader'])
         
@@ -375,7 +378,9 @@ class HybridRecommender:
             loss = await self.train_step(
                 batch,
                 train_data['movie_info_dict'],
-                train_data['user_history_dict']
+                train_data['user_history_dict'],
+                train_data.get('user_tags_dict'),
+                train_data.get('movie_tags_dict')
             )
             epoch_loss += loss
             
@@ -383,6 +388,9 @@ class HybridRecommender:
             progress_bar.set_description(f"Training (loss: {loss:.4f})")
         
         metrics = {'train_loss': epoch_loss / n_batches}
+
+        self.logger.info(f"Epoch: {len(self.history) + 1}")
+        self.logger.info(f"Epoch training loss: {metrics['train_loss']:.4f}")
         
         if valid_data:
             self.logger.info("Starting validation...")
@@ -391,10 +399,7 @@ class HybridRecommender:
                 valid_data['movie_info_dict'],
                 valid_data['user_history_dict']
             )
-            logging.info(f"Validation loss: {val_metrics['val_loss']:.4f}")
-            logging.info(f"Validation MAE: {val_metrics['val_mae']:.4f}")
-            logging.info(f"Validation RMSE: {val_metrics['val_rmse']:.4f}")
-            logging.info(f"Training loss: {metrics['train_loss']:.4f}")
+            self.logger.info(f"Validation metrics: {val_metrics}")
             metrics.update(val_metrics)
         
         self.history.append(metrics)
@@ -407,7 +412,7 @@ class HybridRecommender:
                      user_history_dict: Dict) -> torch.Tensor:
         """Generate predictions for user-item pairs."""
         self.model.eval()
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast(self.device.type):
             user_llm_embeds, item_llm_embeds = await self._get_batch_llm_features(
                 user_ids,
                 item_ids,
@@ -429,9 +434,11 @@ class HybridRecommender:
         save_dict = {
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'config': self.config,
+            'scaler_state_dict': self.scaler.state_dict(),
+            'config': self.config.__dict__,  # Config objekt helyett dictionary-t mentünk
             'history': self.history,
-            'embedding_cache': self.feature_extractor.embedding_cache
+            'feature_cache': self.feature_cache,
+            'steps': self.steps
         }
         
         torch.save(save_dict, path)
@@ -439,54 +446,68 @@ class HybridRecommender:
     
     def load(self, path: str):
         """Load model state and configuration."""
-        checkpoint = torch.load(path, map_location=self.device)
+        # Add HybridConfig to safe globals
+        add_safe_globals([HybridConfig])
+        
+        try:
+            # First try with weights_only=True
+            checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+        except Exception as e:
+            self.logger.warning(f"Could not load with weights_only=True, trying with weights_only=False")
+            # If that fails, try with weights_only=False
+            with safe_globals([HybridConfig]):
+                checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        
+        # Restore config from dictionary
+        config_dict = checkpoint['config']
+        if isinstance(config_dict, dict):
+            for key, value in config_dict.items():
+                setattr(self.config, key, value)
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.history = checkpoint['history']
-        self.feature_extractor.embedding_cache = checkpoint['embedding_cache']
+        if 'scaler_state_dict' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        self.history = checkpoint.get('history', [])
+        self.feature_cache = checkpoint.get('feature_cache', {})
+        self.steps = checkpoint.get('steps', 0)
         
         self.logger.info(f"Model loaded from {path}")
 
-    def calculate_user_embedding_cache(self, user_history_dict: Dict) -> None:
-        """Pre-calculate user embeddings for faster inference."""
-        self.logger.info("Pre-calculating user embeddings...")
-        for user_id, history in user_history_dict.items():
-            if user_id not in self.feature_extractor.embedding_cache:
-                embedding = asyncio.run(
-                    self.feature_extractor.get_user_preference_embedding(history)
-                )
-                self.feature_extractor.embedding_cache[f"user_{user_id}"] = embedding
-
-    def calculate_movie_embedding_cache(self, movie_info_dict: Dict) -> None:
-        """Pre-calculate movie embeddings for faster inference."""
-        self.logger.info("Pre-calculating movie embeddings...")
-        for movie_id, info in movie_info_dict.items():
-            if movie_id not in self.feature_extractor.embedding_cache:
-                embedding = asyncio.run(
-                    self.feature_extractor.get_movie_embedding(info)
-                )
-                self.feature_extractor.embedding_cache[f"movie_{movie_id}"] = embedding
-
+    def precalculate_embeddings(self, 
+                              movie_info_dict: Dict,
+                              user_history_dict: Dict) -> None:
+        """Pre-calculate all embeddings for faster training and inference."""
+        self.logger.info("Pre-calculating embeddings...")
+        
+        async def calculate_all():
+            # Pre-calculate user embeddings
+            for user_id, history in tqdm(user_history_dict.items(), 
+                                       desc="Calculating user embeddings"):
+                cache_key = f"user_{user_id}"
+                if cache_key not in self.feature_cache:
+                    embedding = await self.feature_extractor.get_user_preference_embedding(history)
+                    self.feature_cache[cache_key] = embedding.to(self.device)
+            
+            # Pre-calculate movie embeddings
+            for movie_id, info in tqdm(movie_info_dict.items(),
+                                     desc="Calculating movie embeddings"):
+                cache_key = f"movie_{movie_id}"
+                if cache_key not in self.feature_cache:
+                    embedding = await self.feature_extractor.get_movie_embedding(info)
+                    self.feature_cache[cache_key] = embedding.to(self.device)
+        
+        asyncio.run(calculate_all())
+        self.logger.info("Embedding pre-calculation completed")
+    
     async def get_top_n_recommendations(self,
                                       user_id: int,
                                       movie_info_dict: Dict,
                                       user_history_dict: Dict,
                                       n: int = 10,
-                                      exclude_watched: bool = True) -> List[Tuple[int, float]]:
-        """
-        Generate top-N movie recommendations for a user.
-        
-        Args:
-            user_id: User ID to generate recommendations for
-            movie_info_dict: Dictionary of movie information
-            user_history_dict: Dictionary of user histories
-            n: Number of recommendations to generate
-            exclude_watched: Whether to exclude already watched movies
-            
-        Returns:
-            List of (movie_id, score) tuples
-        """
+                                      exclude_watched: bool = True,
+                                      batch_size: int = 1024) -> List[Tuple[int, float]]:
+        """Generate top-N movie recommendations for a user with batched processing."""
         user_history = user_history_dict[user_id]
         watched_movies = set(user_history['movieId']) if exclude_watched else set()
         candidate_movies = [
@@ -494,20 +515,23 @@ class HybridRecommender:
             if movie_id not in watched_movies
         ]
         
-        # Create batch of user-movie pairs
-        user_ids = torch.tensor([user_id] * len(candidate_movies))
-        movie_ids = torch.tensor(candidate_movies)
+        # Process in batches
+        all_predictions = []
+        for i in range(0, len(candidate_movies), batch_size):
+            batch_movies = candidate_movies[i:i + batch_size]
+            user_ids = torch.tensor([user_id] * len(batch_movies)).to(self.device)
+            movie_ids = torch.tensor(batch_movies).to(self.device)
+            
+            predictions = await self.predict(
+                user_ids,
+                movie_ids,
+                movie_info_dict,
+                user_history_dict
+            )
+            all_predictions.extend(predictions.cpu().numpy())
         
-        # Get predictions
-        predictions = await self.predict(
-            user_ids,
-            movie_ids,
-            movie_info_dict,
-            user_history_dict
-        )
-        
-        # Sort movies by predicted rating
-        movie_scores = list(zip(candidate_movies, predictions.cpu().numpy()))
+        # Sort and return top-N
+        movie_scores = list(zip(candidate_movies, all_predictions))
         movie_scores.sort(key=lambda x: x[1], reverse=True)
         
         return movie_scores[:n]
@@ -517,28 +541,23 @@ class HybridRecommender:
                                      movie_id: int,
                                      movie_info_dict: Dict,
                                      user_history_dict: Dict) -> str:
-        """
-        Generate an explanation for why a movie was recommended to a user.
-        
-        Args:
-            user_id: User ID
-            movie_id: Movie ID
-            movie_info_dict: Dictionary of movie information
-            user_history_dict: Dictionary of user histories
-            
-        Returns:
-            String explanation of the recommendation
-        """
-        # Get user and movie embeddings
-        user_history = user_history_dict[user_id]
-        movie_info = movie_info_dict[movie_id]
-        
-        user_embedding = await self.feature_extractor.get_user_preference_embedding(user_history)
-        movie_embedding = await self.feature_extractor.get_movie_embedding(movie_info)
-        
-        # Get prediction and attention weights
+        """Generate an explanation for why a movie was recommended to a user."""
         self.model.eval()
-        with torch.no_grad():
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            # Get cached embeddings if available
+            user_embedding = self.feature_cache.get(f"user_{user_id}")
+            movie_embedding = self.feature_cache.get(f"movie_{movie_id}")
+            
+            if user_embedding is None or movie_embedding is None:
+                user_history = user_history_dict[user_id]
+                movie_info = movie_info_dict[movie_id]
+                
+                if user_embedding is None:
+                    user_embedding = await self.feature_extractor.get_user_preference_embedding(user_history)
+                if movie_embedding is None:
+                    movie_embedding = await self.feature_extractor.get_movie_embedding(movie_info)
+            
+            # Get prediction
             user_id_tensor = torch.tensor([user_id]).to(self.device)
             movie_id_tensor = torch.tensor([movie_id]).to(self.device)
             user_embedding = user_embedding.unsqueeze(0).to(self.device)
@@ -554,11 +573,11 @@ class HybridRecommender:
         
         # Generate explanation using LLM
         user_profile = await self.feature_extractor.provider.get_completion(
-            self._create_user_profile_prompt(user_history)
+            self._create_user_profile_prompt(user_history_dict[user_id])
         )
         
         movie_profile = await self.feature_extractor.provider.get_completion(
-            self._create_movie_profile_prompt(movie_info)
+            self._create_movie_profile_prompt(movie_info_dict[movie_id])
         )
         
         explanation_prompt = f"""
@@ -580,64 +599,3 @@ class HybridRecommender:
         
         explanation = await self.feature_extractor.provider.get_completion(explanation_prompt)
         return explanation
-
-    def _create_user_profile_prompt(self, user_history: pd.DataFrame) -> str:
-        """Create a prompt for generating user profile."""
-        top_movies = user_history[user_history['rating'] >= 4.0]['title'].tolist()[:5]
-        favorite_genres = set()
-        for genres in user_history[user_history['rating'] >= 4.0]['genres']:
-            favorite_genres.update(genres)
-        
-        return f"""
-        Create a viewer profile based on the following information:
-        - Favorite movies: {', '.join(top_movies)}
-        - Preferred genres: {', '.join(favorite_genres)}
-        - Total movies rated: {len(user_history)}
-        - Average rating: {user_history['rating'].mean():.2f}
-        """
-
-    def _create_movie_profile_prompt(self, movie_info: Dict) -> str:
-        """Create a prompt for generating movie profile."""
-        return f"""
-        Create a movie profile based on the following information:
-        - Title: {movie_info['title']}
-        - Genres: {', '.join(movie_info['genres'])}
-        - Description: {movie_info.get('description', '')}
-        """
-
-    def get_evaluation_metrics(self) -> Dict[str, List[float]]:
-        """Get training and validation metrics history."""
-        metrics = {
-            'train_loss': [],
-            'val_loss': [],
-            'val_mae': [],
-            'val_rmse': []
-        }
-        
-        for epoch_metrics in self.history:
-            for metric in metrics:
-                if metric in epoch_metrics:
-                    metrics[metric].append(epoch_metrics[metric])
-        
-        return metrics
-
-    def get_model_summary(self) -> str:
-        """Get a summary of the model architecture and parameters."""
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        
-        summary = [
-            "Hybrid Recommender Model Summary:",
-            f"- Number of users: {self.config.n_users}",
-            f"- Number of items: {self.config.n_items}",
-            f"- Embedding dimension: {self.config.n_factors}",
-            f"- LLM embedding dimension: {self.config.llm_embedding_dim}",
-            f"- Total parameters: {total_params:,}",
-            f"- Trainable parameters: {trainable_params:,}",
-            f"- Device: {self.device}",
-            f"- Training epochs: {len(self.history)}",
-            "\nModel Architecture:",
-            str(self.model)
-        ]
-        
-        return "\n".join(summary)

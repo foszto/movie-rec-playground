@@ -1,4 +1,5 @@
 # src/cli/train.py
+import os
 import click
 import logging
 import yaml
@@ -10,6 +11,9 @@ from src.data.dataset import MovieLensDataset
 from src.models.hybrid import HybridRecommender
 from src.utils.data_io import load_preprocessed_data
 from src.utils.visualization import plot_training_history
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 
 @click.command()
 @click.option('--data-dir', type=click.Path(exists=True), required=True,
@@ -31,7 +35,9 @@ def train(data_dir: str, output_dir: str, config_path: str):
             config = yaml.safe_load(f)
         
         logger.info("Loading preprocessed data...")
-        ratings_df, movies_df, user_history_dict, movie_info_dict = load_preprocessed_data(data_dir)
+        (ratings_df, movies_df, tags_df, 
+         user_history_dict, movie_info_dict,
+         user_tags_dict, movie_tags_dict) = load_preprocessed_data(data_dir)
         
         train_dataset, valid_dataset = MovieLensDataset.train_valid_split(
             ratings_df,
@@ -51,12 +57,17 @@ def train(data_dir: str, output_dir: str, config_path: str):
         train_data = {
             'dataloader': train_dataset.get_dataloader(batch_size=config.get('batch_size', 64)),
             'movie_info_dict': movie_info_dict,
-            'user_history_dict': user_history_dict
+            'user_history_dict': user_history_dict,
+            'user_tags_dict': user_tags_dict,
+            'movie_tags_dict': movie_tags_dict
         }
+        
         valid_data = {
             'dataloader': valid_dataset.get_dataloader(batch_size=config.get('batch_size', 64)),
             'movie_info_dict': movie_info_dict,
-            'user_history_dict': user_history_dict
+            'user_history_dict': user_history_dict,
+            'user_tags_dict': user_tags_dict,
+            'movie_tags_dict': movie_tags_dict
         }
         
         logger.info("Starting training...")
