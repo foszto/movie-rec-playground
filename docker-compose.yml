@@ -26,19 +26,19 @@ services:
     command: uvicorn app:app --host ${API_HOST} --port ${API_PORT} --reload
 
   frontend:
-    image: node:18-alpine
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
     ports:
       - "${PORT}:${PORT}"
     volumes:
       - ./frontend:/app
-    working_dir: /app
+      - /app/node_modules
     environment:
       - REACT_APP_API_URL=${REACT_APP_API_URL}
       - PORT=${PORT}
     env_file:
       - .env
-    command: >
-      sh -c "npm install && npm start"
     depends_on:
       - api
 

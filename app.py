@@ -1,10 +1,12 @@
 from fastapi import FastAPI, HTTPException
+from torch.serialization import safe_globals
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Optional
 import torch
 import logging
 from pathlib import Path
+import asyncio
 from datetime import datetime
 
 from src.models.hybrid import HybridRecommender
@@ -56,14 +58,24 @@ async def load_model():
         logger = logging.getLogger(__name__)
         
         # Load model
-        model_path = "models/final_model.pt"  # Update with your model path
-        data_dir = "data/processed"  # Update with your data directory
+        model_path = "models/high/final_model.pt"  # Update with your model path
+        data_dir = "data/processed_high"  # Update with your data directory
         
         if not Path(model_path).exists():
             raise FileNotFoundError(f"Model file not found at {model_path}")
             
-        # Load checkpoint
-        checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
+        # Load checkpoint with fallback
+        try:
+            # First try with weights_only=True
+            checkpoint = torch.load(model_path, map_location=torch.device('cpu'), weights_only=True)
+            logger.info("Model loaded with weights_only=True")
+        except Exception as e:
+            logger.warning("Could not load with weights_only=True, trying with weights_only=False")
+            # If that fails, try with weights_only=False
+            with safe_globals([HybridConfig]):
+                checkpoint = torch.load(model_path, map_location=torch.device('cpu'), weights_only=False)
+            logger.info("Model loaded with weights_only=False")
+            
         config = HybridConfig(**checkpoint['config'])
         
         # Initialize and load model
