@@ -68,6 +68,7 @@ Uses minimally filtered data with all default thresholds:
 - Python 3.8+
 - CUDA-compatible GPU (recommended)
 - Docker and Docker Compose
+- nvidia-container-toolkit
 
 ## Environment Setup
 
