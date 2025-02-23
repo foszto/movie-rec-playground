@@ -13,23 +13,23 @@ model_params:
   weight_decay: 0.02
   l2_reg: 0.01
   max_grad_norm: 1.0
-  device: "cuda"  # or "cpu"
+  device: cuda # or "cpu"
 
 # LLM parameters
 llm_params:
-  provider: "sentence_transformers"
-  model_name: "all-MiniLM-L6-v2"
+  provider: sentence_transformers
+  model_name: all-MiniLM-L6-v2
   embedding_dim: 384
   use_cached_embeddings: true
-  
+
 # Evaluation parameters
 metrics:
   use_ndcg: true
   use_map: true
   top_k: [5, 10, 20]
-  
+
 # Logging parameters
 logging:
-  level: "INFO"
+  level: INFO
   save_model_history: true
-  checkpoint_frequency: 5  # epochs
+  checkpoint_frequency: 5 # epochs
