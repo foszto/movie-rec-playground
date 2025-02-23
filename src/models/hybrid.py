@@ -31,14 +31,14 @@ class HybridRecommender(BaseModel):
             n_items=config.n_items,
             n_factors=config.n_factors,
             llm_dim=config.llm_embedding_dim,
-            dropout=0.5,  # Increased dropout
+            dropout=0.4,
         ).to(self.device)
 
         # Initialize optimizer with higher learning rate and weight decay
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
-            lr=2e-4,  # Increased learning rate
-            weight_decay=0.02,  # Stronger weight decay
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
         )
 
         # Learning rate scheduler
@@ -54,9 +54,9 @@ class HybridRecommender(BaseModel):
         )
 
         # Initialize loss function
-        self.criterion = DiversityAwareLoss(diversity_lambda=0.1, rating_lambda=0.2).to(
-            self.device
-        )
+        self.criterion = DiversityAwareLoss(
+            diversity_lambda=self.l2_lambda, rating_lambda=self.l2_lambda
+        ).to(self.device)
 
         # Initialize mixed precision scaler
         self.scaler = torch.amp.GradScaler(self.device)

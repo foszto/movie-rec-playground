@@ -210,7 +210,7 @@ class LLMFeatureExtractor:
         # Get genre preferences with weighted history
         genre_preferences = self.genre_processor.get_genre_preferences(user_history)
 
-        # Use more genres (increased from 5 to 10)
+        # Use more genres (increased from 5 to 8)
         top_genres = sorted(
             [
                 (g, genre_preferences["genre_scores"][g])
@@ -218,7 +218,7 @@ class LLMFeatureExtractor:
             ],
             key=lambda x: x[1],
             reverse=True,
-        )[:10]
+        )[:8]
 
         # Enhanced genre descriptions with rating patterns
         genre_descriptions = []
@@ -227,7 +227,7 @@ class LLMFeatureExtractor:
             genre_movies = user_history[
                 user_history["genres"].apply(
                     lambda x, g=genre: g in x
-                )  # g=genre rögzíti az aktuális értéket
+                )  # g=genre
             ]
             if not genre_movies.empty:
                 genre_avg_rating = float(genre_movies["rating"].mean())
@@ -259,11 +259,23 @@ class LLMFeatureExtractor:
             f"Rating {rating}: {count} times" for rating, count in rating_dist.items()
         ]
 
+        # Get top 30 rated movies
+        top_movies = user_history.nlargest(10, ["rating", "timestamp"])[
+            ["title", "rating"]
+        ]
+        top_movies_text = [
+            f"{title} (rated {rating:.1f})"
+            for title, rating in zip(top_movies["title"], top_movies["rating"])
+        ]
+
         # Generate comprehensive profile text
         profile_text = f"""
         User Genre Preferences:
         {chr(10).join(genre_descriptions)}
         
+        Top Rated Movies:
+        {chr(10).join(top_movies_text)}
+
         Rating Distribution:
         {chr(10).join(rating_preferences)}
         

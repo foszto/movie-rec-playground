@@ -5,7 +5,7 @@ import torch.nn as nn
 class DiversityAwareLoss(nn.Module):
     """Loss function that encourages diverse recommendations."""
 
-    def __init__(self, diversity_lambda: float = 0.1, rating_lambda: float = 0.2):
+    def __init__(self, diversity_lambda: float = 0.25, rating_lambda: float = 0.2):
         super().__init__()
         self.diversity_lambda = diversity_lambda
         self.rating_lambda = rating_lambda

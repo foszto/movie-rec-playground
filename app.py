@@ -29,7 +29,7 @@ class Config:
 
     # Model Configuration
     MODEL_PATH = os.getenv("MODEL_PATH", "models/small/final_model.pt")
-    DATA_DIR = "data/processed/small"  # os.getenv("DATA_DIR", "data/processed/small")
+    DATA_DIR = os.getenv("DATA_DIR", "data/processed/small")
 
     # Recommendation Settings
     TOP_K_RECOMMENDATIONS = int(os.getenv("TOP_K_RECOMMENDATIONS", 5))
