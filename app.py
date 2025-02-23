@@ -5,9 +5,7 @@ from typing import List, Dict, Optional
 import torch
 import logging
 from pathlib import Path
-import asyncio
 from datetime import datetime, timedelta
-import numpy as np
 from torch.serialization import safe_globals
 import os
 from dotenv import load_dotenv

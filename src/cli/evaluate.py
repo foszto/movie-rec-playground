@@ -2,7 +2,6 @@ import click
 import logging
 import pandas as pd
 import torch
-import numpy as np
 import asyncio
 from pathlib import Path
 from tqdm import tqdm
@@ -16,7 +15,6 @@ from src.configs.model_config import HybridConfig
 
 async def evaluate_model_with_progress(model, test_data, device):
     """Evaluate model with progress bar, keeping tensors on GPU for efficiency."""
-    # Initialize list for holding GPU tensors
     predictions_list = []
     targets_list = []
 
@@ -33,7 +31,7 @@ async def evaluate_model_with_progress(model, test_data, device):
         for batch_idx, batch in enumerate(progress_bar):
             user_ids = batch['user_id'].to(device)
             item_ids = batch['item_id'].to(device)
-            ratings = batch['rating'].to(device)  # Move ratings to GPU immediately
+            ratings = batch['rating'].to(device)
 
             predictions = await model.predict(
                 user_ids,
@@ -42,21 +40,17 @@ async def evaluate_model_with_progress(model, test_data, device):
                 test_data['user_history_dict']
             )
 
-            # Keep tensors on GPU
             predictions_list.append(predictions)
             targets_list.append(ratings)
 
-            # Calculate statistics on GPU
             avg_rating = torch.mean(predictions).item()
             progress_bar.set_description(
                 f"Batch {batch_idx + 1}/{total_batches} [Avg Rating: {avg_rating:.2f}]"
             )
 
-        # Concatenate all tensors on GPU
         all_predictions = torch.cat(predictions_list)
         all_targets = torch.cat(targets_list)
 
-        # Only move to CPU at the very end
         return all_predictions.cpu().numpy(), all_targets.cpu().numpy()
 
 @click.command()
@@ -112,7 +106,26 @@ def evaluate(data_dir: str, model_path: str, output_dir: str, batch_size: int):
         with safe_globals([HybridConfig]):
             checkpoint = torch.load(model_file, map_location=device, weights_only=False)
         
-        model = HybridRecommender(checkpoint['config'])
+        # Get required parameters for HybridConfig
+        config_dict = checkpoint['config']
+        
+        # Initialize HybridConfig with required parameters
+        config = HybridConfig(
+            model_type=config_dict.get('model_type', 'hybrid'),  # Default to 'hybrid' if not specified
+            n_users=test_dataset.n_users,  # Get from dataset
+            n_items=test_dataset.n_items   # Get from dataset
+        )
+        
+        # Set remaining attributes from the dictionary
+        for key, value in config_dict.items():
+            if key not in ['model_type', 'n_users', 'n_items']:  # Skip already set attributes
+                setattr(config, key, value)
+            
+        # Ensure device is set
+        config.device = device
+        
+        # Initialize model with the reconstructed config
+        model = HybridRecommender(config)
         model.load(model_file)
         
         model_loading.update(1)

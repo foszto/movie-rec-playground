@@ -70,23 +70,23 @@ The project includes the Food.com dataset with:
 ## Preprocess
    ```bash
    docker-compose exec dev bash
-   python main.py preprocess --data-dir data/raw --output-dir data/processed --min-user-ratings 500 --log-file logs/preprocess_log.txt
+   python main.py preprocess --data-dir data/raw --output-dir data/processed/small --min-user-ratings 500 --log-file logs/preprocess_log.txt
    ```
 
 ## Train
 
    ```bash
    docker-compose exec dev bash
-   python main.py train --data-dir data/processed --output-dir models --config-path src/configs/model_config.yaml
+   python main.py train --data-dir data/processed/small --output-dir models/small --config-path src/configs/model_config.yaml
 
-   python main.py train --data-dir data/processed_high --output-dir models/high --config-path src/configs/model_config.yaml
+   python main.py train --data-dir data/processed/high --output-dir models/high --config-path src/configs/model_config.yaml
    ```
 
 ## Evaluate
 
    ```bash
    docker-compose exec dev bash
-   python main.py evaluate --data-dir data/processed --model-path models --output-dir output
+   python main.py evaluate --data-dir data/processed/small --model-path models/small --output-dir models/small/eval
    ```
 
 ## Recommend
