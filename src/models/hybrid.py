@@ -37,7 +37,7 @@ class HybridRecommender(BaseModel):
         # Initialize optimizer with higher learning rate and weight decay
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
-            lr=config.learning_rate,
+            lr=float(config.learning_rate),
             weight_decay=config.weight_decay,
         )
 
