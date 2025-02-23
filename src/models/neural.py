@@ -89,9 +89,9 @@ class HybridNet(nn.Module):
         item_llm_embeds: torch.Tensor,
     ) -> torch.Tensor:
         """Forward pass of the hybrid model."""
-        # Get collaborative filtering embeddings with batch norm
-        user_embed = self.user_bn(self.user_factors(user_ids))
-        item_embed = self.item_bn(self.item_factors(item_ids))
+        # Get collaborative filtering embeddings
+        user_embed = self.user_factors(user_ids)
+        item_embed = self.item_factors(item_ids)
 
         # Get bias terms
         user_bias = self.user_biases(user_ids).squeeze(-1)
@@ -109,7 +109,7 @@ class HybridNet(nn.Module):
 
         attended_item, _ = self.attention(item_context, user_context, user_context)
 
-        # Element-wise interaction with strong genre emphasis
+        # Element-wise interaction
         cf_interaction = user_embed * item_embed * 1.5
         llm_interaction = user_llm_proj * item_llm_proj
 

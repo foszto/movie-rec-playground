@@ -205,53 +205,91 @@ def get_recent_favorites(user_data, limit: int = None) -> List[RatedMovie]:
 
 
 async def generate_recommendations(
-    user_id: int, limit: int = 5
+    user_id: int, limit: int = 10
 ) -> List[RecommendedMovie]:
     """Generate personalized recommendations with explanations."""
     recommendations = await model.get_top_n_recommendations(
-        user_id, movie_info_dict, user_history_dict, n=limit, exclude_watched=True
+        user_id,
+        movie_info_dict,
+        user_history_dict,
+        n=limit * 4,  # More recommendations to filter out the best ones
+        exclude_watched=True,
     )
 
+    # First, get user's favorite genres
+    user_data = user_history_dict[user_id]
+    genre_ratings = {}
+    for _, row in user_data.iterrows():
+        if row["rating"] >= 3.5:
+            movie_id = int(row["movieId"])
+            if movie_id in movie_info_dict:
+                for genre in movie_info_dict[movie_id].get("genres", []):
+                    if isinstance(genre, str):
+                        genre_ratings[genre] = genre_ratings.get(genre, 0) + 1
+
+    favorite_genres = sorted(genre_ratings.items(), key=lambda x: x[1], reverse=True)[
+        :5
+    ]
+    favorite_genres = [genre for genre, _ in favorite_genres]
+
     result = []
+    remaining_movies = []
+
+    # Filter recommendations based on favorite genres
     for movie_id, predicted_rating in recommendations:
         movie_info = movie_info_dict[movie_id]
         genres = movie_info.get("genres", [])
         if isinstance(genres, str):
             genres = [g.strip() for g in genres.split("|")]
 
-        # Generate explanation for the recommendation
-        user_data = user_history_dict[user_id]
-        genre_ratings = {}
-        for _, row in user_data.iterrows():
-            if row["rating"] >= 4.0:  # Only consider high ratings
-                movie_id = int(row["movieId"])
-                if movie_id in movie_info_dict:
-                    for genre in movie_info_dict[movie_id].get("genres", []):
-                        if isinstance(genre, str):
-                            genre_ratings[genre] = genre_ratings.get(genre, 0) + 1
-
-        favorite_genres = sorted(
-            genre_ratings.items(), key=lambda x: x[1], reverse=True
-        )[:3]
-        favorite_genres = [genre for genre, _ in favorite_genres]
-
-        # Generate simple explanation based on genres
         matching_genres = [g for g in genres if g in favorite_genres]
-        if matching_genres:
-            explanation = f"Look this somethin familiar {', '.join(matching_genres)}"
-        else:
-            explanation = "Try this movie from a new genre!"
+        movie_data = {
+            "id": movie_id,
+            "title": movie_info.get("title", "Unknown"),
+            "genres": genres,
+            "predictedRating": float(predicted_rating),
+            "matching_count": len(matching_genres),
+            "matching_genres": matching_genres,
+        }
 
-        result.append(
-            {
-                "id": movie_id,
-                "title": movie_info.get("title", "Unknown"),
-                "genres": genres,
-                "predictedRating": float(predicted_rating),
-                "confidence": 0.8,  # Could be calculated based on model certainty
-                "reason": explanation,
-            }
-        )
+        if len(matching_genres) >= 2:
+            movie_data["confidence"] = min(1.0, 0.6 + 0.1 * len(matching_genres))
+            movie_data["reason"] = (
+                f"This matches your favorite genres: {', '.join(matching_genres)}"
+            )
+            result.append(movie_data)
+        else:
+            remaining_movies.append(movie_data)
+
+        if len(result) >= limit:
+            break
+
+    # If we still don't have enough recommendations, add one-match movies
+    if len(result) < limit:
+        one_match_movies = [m for m in remaining_movies if m["matching_count"] == 1]
+        for movie in one_match_movies:
+            movie["confidence"] = 0.6
+            movie["reason"] = (
+                f"This matches one of your favorite genres: {movie['matching_genres'][0]}"
+            )
+            result.append(movie)
+            if len(result) >= limit:
+                break
+
+    # If we still don't have enough recommendations, add non-matching movies
+    if len(result) < limit:
+        no_match_movies = [m for m in remaining_movies if m["matching_count"] == 0]
+        for movie in no_match_movies:
+            movie["confidence"] = 0.5
+            movie["reason"] = "Try something completely new!"
+            result.append(movie)
+            if len(result) >= limit:
+                break
+
+    # Clean up the result
+    for movie in result:
+        movie.pop("matching_count", None)
+        movie.pop("matching_genres", None)
 
     return result
 

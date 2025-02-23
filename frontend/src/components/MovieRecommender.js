@@ -1,8 +1,16 @@
-import React, { useState } from 'react';
-import { Loader2, Star, StarHalf, Search, Clock, Award, TrendingUp } from 'lucide-react';
+import React, { useState } from "react";
+import {
+  Loader2,
+  Star,
+  StarHalf,
+  Search,
+  Clock,
+  Award,
+  TrendingUp,
+} from "lucide-react";
 
 const MovieRecommender = () => {
-  const [userId, setUserId] = useState('');
+  const [userId, setUserId] = useState("");
   const [selectedUser, setSelectedUser] = useState(null);
   const [userData, setUserData] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -14,22 +22,22 @@ const MovieRecommender = () => {
 
     setLoading(true);
     setError(null);
-    
+
     try {
       const response = await fetch(`/api/recommendations/${userId}`);
       if (!response.ok) {
         if (response.status === 404) {
-          throw new Error('Felhasználó nem található');
+          throw new Error("User not found");
         }
-        throw new Error('Hiba történt az ajánlások betöltésekor');
+        throw new Error("Error fetching data");
       }
       const data = await response.json();
-      
+
       setSelectedUser(userId);
       setUserData(data);
     } catch (error) {
       setError(error.message);
-      console.error('Error:', error);
+      console.error("Error:", error);
     } finally {
       setLoading(false);
     }
@@ -38,13 +46,15 @@ const MovieRecommender = () => {
   const RatingStars = ({ rating }) => {
     const fullStars = Math.floor(rating);
     const hasHalfStar = rating % 1 >= 0.5;
-    
+
     return (
       <div className="flex items-center">
         {[...Array(fullStars)].map((_, i) => (
           <Star key={i} className="w-4 h-4 text-yellow-400 fill-yellow-400" />
         ))}
-        {hasHalfStar && <StarHalf className="w-4 h-4 text-yellow-400 fill-yellow-400" />}
+        {hasHalfStar && (
+          <StarHalf className="w-4 h-4 text-yellow-400 fill-yellow-400" />
+        )}
         <span className="ml-1 text-sm">({rating.toFixed(1)})</span>
       </div>
     );
@@ -54,12 +64,16 @@ const MovieRecommender = () => {
     <div className="flex flex-col border rounded-lg bg-white p-4 shadow-sm hover:shadow-md transition-shadow">
       <h4 className="font-medium text-lg mb-2">{movie.title}</h4>
       <div className="text-sm text-gray-600 mb-2">
-        {movie.genres.join(', ')}
+        {movie.genres.join(", ")}
       </div>
       <div className="mt-auto space-y-2">
         <div className="flex items-center justify-between">
-          <RatingStars rating={type === 'recommendation' ? movie.predictedRating : movie.rating} />
-          {type === 'history' && (
+          <RatingStars
+            rating={
+              type === "recommendation" ? movie.predictedRating : movie.rating
+            }
+          />
+          {type === "history" && (
             <span className="text-xs text-gray-500">
               {new Date(movie.timestamp).toLocaleDateString()}
             </span>
@@ -76,33 +90,40 @@ const MovieRecommender = () => {
 
   const UserProfile = ({ profile }) => (
     <div className="bg-white rounded-xl shadow-sm p-6 border border-gray-100 mb-8">
-      <h2 className="text-xl font-semibold mb-4">Felhasználói Profil</h2>
+      <h2 className="text-xl font-semibold mb-4">User profile</h2>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         <div>
-          <h3 className="font-medium mb-2">Kedvenc műfajok</h3>
+          <h3 className="font-medium mb-2">Favorite genres</h3>
           <div className="flex flex-wrap gap-2">
-            {profile.favoriteGenres.map(genre => (
-              <span key={genre} className="px-3 py-1 bg-blue-50 text-blue-700 rounded-full text-sm">
+            {profile.favoriteGenres.map((genre) => (
+              <span
+                key={genre}
+                className="px-3 py-1 bg-blue-50 text-blue-700 rounded-full text-sm"
+              >
                 {genre}
               </span>
             ))}
           </div>
         </div>
         <div>
-          <h3 className="font-medium mb-2">Statisztika</h3>
+          <h3 className="font-medium mb-2">Statistics</h3>
           <div className="space-y-2 text-sm">
             <div className="flex items-center justify-between">
-              <span>Átlagos értékelés:</span>
-              <span className="font-medium">{profile.averageRating.toFixed(1)}</span>
+              <span>Average rating:</span>
+              <span className="font-medium">
+                {profile.averageRating.toFixed(1)}
+              </span>
             </div>
             <div className="flex items-center justify-between">
-              <span>Összes értékelés:</span>
+              <span>Total ratings:</span>
               <span className="font-medium">{profile.totalRatings}</span>
             </div>
             <div className="flex items-center justify-between">
-              <span>Aktivitás:</span>
-              <span className={`font-medium ${profile.recentActivity ? 'text-green-600' : 'text-gray-500'}`}>
-                {profile.recentActivity ? 'Aktív' : 'Inaktív'}
+              <span>Activity:</span>
+              <span
+                className={`font-medium ${profile.recentActivity ? "text-green-600" : "text-gray-500"}`}
+              >
+                {profile.recentActivity ? "Aktív" : "Inaktív"}
               </span>
             </div>
           </div>
@@ -116,10 +137,12 @@ const MovieRecommender = () => {
       <div className="flex items-center gap-2 mb-4">
         <Icon className="w-5 h-5 text-blue-600" />
         <h2 className="text-xl font-semibold">{title}</h2>
-        <span className="text-sm text-gray-600 ml-auto">({movies.length} film)</span>
+        <span className="text-sm text-gray-600 ml-auto">
+          ({movies.length} movie)
+        </span>
       </div>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {movies.map(movie => (
+        {movies.map((movie) => (
           <MovieBox key={movie.id} movie={movie} type={type} />
         ))}
       </div>
@@ -130,16 +153,21 @@ const MovieRecommender = () => {
     <div className="min-h-screen bg-gray-50 py-8">
       <div className="max-w-6xl mx-auto px-4">
         <div className="text-center mb-8">
-          <h1 className="text-3xl font-bold mb-8 text-gray-800">MovieLens Film Ajánló</h1>
+          <h1 className="text-3xl font-bold mb-8 text-gray-800">
+            MovieLens Film Recommendation
+          </h1>
           <div className="max-w-md mx-auto bg-white rounded-xl shadow-md p-6 border border-gray-100">
-            <form onSubmit={handleSearch} className="flex flex-col sm:flex-row gap-4">
+            <form
+              onSubmit={handleSearch}
+              className="flex flex-col sm:flex-row gap-4"
+            >
               <div className="flex-grow">
                 <div className="relative">
                   <input
                     type="number"
                     value={userId}
                     onChange={(e) => setUserId(e.target.value)}
-                    placeholder="Adja meg a felhasználó ID-t..."
+                    placeholder="Enter the user ID... 1, 2, 3, etc."
                     className="w-full pl-4 pr-10 py-3 border-2 border-gray-200 rounded-lg 
                              focus:outline-none focus:border-blue-500 transition-colors
                              text-gray-800 placeholder-gray-400
@@ -166,7 +194,7 @@ const MovieRecommender = () => {
                 ) : (
                   <>
                     <Search className="w-5 h-5" />
-                    <span>Keresés</span>
+                    <span>Search</span>
                   </>
                 )}
               </button>
@@ -189,23 +217,23 @@ const MovieRecommender = () => {
         {userData && !loading && (
           <>
             <UserProfile profile={userData.userProfile} />
-            
+
             <MovieSection
-              title="Személyre szabott ajánlások"
+              title="Personalised recommendations"
               movies={userData.recommendations}
               type="recommendation"
               icon={TrendingUp}
             />
-            
+
             <MovieSection
-              title="Legjobban értékelt filmek"
+              title="Top rated films by user"
               movies={userData.topRatedMovies}
               type="history"
               icon={Award}
             />
-            
+
             <MovieSection
-              title="Legutóbbi kedvencek"
+              title="Recent favourites"
               movies={userData.recentFavorites}
               type="history"
               icon={Clock}
