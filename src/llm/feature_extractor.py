@@ -52,29 +52,44 @@ class LLMFeatureExtractor:
         self.genre_processor = OptimizedGenreProcessor()
     
     async def process_user_tags(self, user_tags: pd.DataFrame) -> torch.Tensor:
-        """Process user tags to create tag-based user profile."""
+        """Process user tags with enhanced genre focus."""
         self.logger.info("Processing user tags...")
         torch.set_grad_enabled(False)
         torch.set_default_device(self.device)
+        
         if user_tags.empty:
             return torch.zeros(self.embedding_dim, device=self.device)
             
-        # Aggregate tags by frequency
-        tag_counts = user_tags['tag'].value_counts()
-        top_tags = tag_counts.head(10).index.tolist()
+        # Weight tags based on their relevance to genres
+        genre_related_tags = {
+            'action', 'adventure', 'animation', 'comedy', 'crime', 'documentary',
+            'drama', 'family', 'fantasy', 'horror', 'mystery', 'romance', 'sci-fi',
+            'thriller', 'war', 'western'
+        }
+        
+        # Add weight column based on genre relevance
+        user_tags['weight'] = user_tags['tag'].apply(
+            lambda x: 2.0 if x.lower() in genre_related_tags else 1.0
+        )
+        
+        # Aggregate tags by weighted frequency
+        tag_weights = user_tags.groupby('tag')['weight'].sum()
+        top_tags = tag_weights.nlargest(15).index.tolist()  # Increased from 10 to 15
         
         # Get embeddings for top tags
         tag_embeddings = []
+        weights = []
         for tag in top_tags:
             embedding = self.model.encode(tag, convert_to_tensor=True).to(self.device)
             tag_embeddings.append(embedding)
+            weights.append(tag_weights[tag])
             
         if not tag_embeddings:
             return torch.zeros(self.embedding_dim, device=self.device)
             
-        # Stack and process tag embeddings
-        tag_tensor = torch.stack(tag_embeddings).device(self.device)
-        tag_weights = torch.softmax(torch.tensor(tag_counts[:len(tag_embeddings)]), dim=0).device(self.device)
+        # Stack and process tag embeddings with emphasis on genre-related tags
+        tag_tensor = torch.stack(tag_embeddings).to(self.device)
+        tag_weights = torch.softmax(torch.tensor(weights), dim=0).to(self.device)
         
         # Project to lower dimension
         projected_tags = self.tag_embedding(tag_tensor)
@@ -141,27 +156,64 @@ class LLMFeatureExtractor:
         if user_tags is not None and not user_tags.empty:
             tag_embedding = await self.process_user_tags(user_tags)
             # Combine embeddings with equal weights
-            combined = (base_embedding + tag_embedding) / 2
+            combined = (base_embedding * 0.7 + tag_embedding * 0.3) / 2
             return F.normalize(combined, p=2, dim=0)
         
         return base_embedding
     
     async def _get_base_user_embedding(self, user_history: pd.DataFrame) -> torch.Tensor:
-        """Generate base user embedding with optimized genre processing."""
+        """Generate base user embedding with enhanced genre focus."""
         # Check cache
         cache_key = f"user_{len(user_history)}_{user_history['timestamp'].max()}_{user_history['rating'].mean()}"
         if cache_key in self.embedding_cache:
             return self.embedding_cache[cache_key]
         
-        # Get genre preferences
-        genre_preferences = self.genre_processor.get_genre_preferences(user_history)
-        genre_text = self.genre_processor.generate_genre_feature_text(genre_preferences)
+        # Weight movies based on ratings
+        user_history['weight'] = user_history['rating'].apply(
+            lambda x: 2.0 if x >= 4.0 else (0.5 if x <= 2.0 else 1.0)
+        )
         
-        # Get basic viewing stats - only calculate what's needed
+        # Get genre preferences with weighted history
+        genre_preferences = self.genre_processor.get_genre_preferences(user_history)
+        
+        # Generate detailed genre text with emphasis on highly rated genres
+        top_genres = sorted(
+            [(g, genre_preferences['genre_scores'][g]) 
+             for g in genre_preferences['liked_genres']],
+            key=lambda x: x[1],
+            reverse=True
+        )[:5]
+        
+        # Create detailed genre descriptions
+        genre_descriptions = []
+        for genre, score in top_genres:
+            similar_genres = genre_preferences['similar_genres'].get(genre, [])
+            similar_text = f" (similar to {', '.join(g['genre'] for g in similar_genres[:2])})" if similar_genres else ""
+            genre_descriptions.append(
+                f"Strong preference for {genre} (score: {score:.2f}){similar_text}"
+            )
+        
+        # Calculate recent activity using timestamp as integer
+        max_timestamp = user_history['timestamp'].max()
+        # 90 days in seconds: 90 * 24 * 60 * 60 = 7776000
+        recent_threshold = max_timestamp - 7776000
+        recent_ratings = user_history[user_history['timestamp'] > recent_threshold]
+        recent_high_ratings = recent_ratings[recent_ratings['rating'] >= 4.0]
+        
+        # Generate comprehensive profile text
         profile_text = f"""
-        {genre_text}
-        Total ratings: {len(user_history)}
+        User Genre Preferences:
+        {chr(10).join(genre_descriptions)}
+        
+        Recent Activity (last 90 days):
+        Total ratings: {len(recent_ratings)}
+        High ratings (4+): {len(recent_high_ratings)}
+        Average rating: {recent_ratings['rating'].mean():.2f}
+        
+        Overall Stats:
+        Total movies rated: {len(user_history)}
         Average rating: {user_history['rating'].mean():.2f}
+        Rating spread: {user_history['rating'].std():.2f}
         """
         
         # Get embedding

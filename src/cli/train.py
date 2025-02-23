@@ -13,6 +13,52 @@ from src.models.hybrid import HybridRecommender
 from src.utils.data_io import load_preprocessed_data
 from src.utils.visualization import plot_training_history
 
+
+class EarlyStoppingHandler:
+    """Enhanced early stopping with multiple metrics and smoothing."""
+    
+    def __init__(self, patience: int = 5, min_delta: float = 0.001, alpha: float = 0.9):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.alpha = alpha  # smoothing factor
+        self.best_score = float('inf')
+        self.counter = 0
+        self.smoothed_metrics = {}
+    
+    def update_smoothed_metrics(self, metrics: dict) -> dict:
+        """Update exponential moving average of metrics."""
+        if not self.smoothed_metrics:
+            self.smoothed_metrics = metrics.copy()
+        else:
+            for key, value in metrics.items():
+                if key in self.smoothed_metrics:
+                    self.smoothed_metrics[key] = (
+                        self.alpha * self.smoothed_metrics[key] +
+                        (1 - self.alpha) * value
+                    )
+        return self.smoothed_metrics
+    
+    def get_combined_score(self, metrics: dict) -> float:
+        """Calculate combined score from multiple metrics."""
+        smoothed = self.update_smoothed_metrics(metrics)
+        return (
+            smoothed.get('val_loss', 0) * 0.4 +
+            smoothed.get('val_mae', 0) * 0.3 +
+            smoothed.get('val_rmse', 0) * 0.3
+        )
+    
+    def __call__(self, metrics: dict) -> bool:
+        """Check if training should stop."""
+        score = self.get_combined_score(metrics)
+        
+        if score < self.best_score - self.min_delta:
+            self.best_score = score
+            self.counter = 0
+            return False
+        
+        self.counter += 1
+        return self.counter >= self.patience
+
 # Set multiprocessing start method
 mp.set_start_method('spawn', force=True)
 
@@ -58,11 +104,10 @@ def train(data_dir: str, output_dir: str, config_path: str):
         
         model = HybridRecommender(model_config)
         
-        # Módosított DataLoader konfigurációk
         train_data = {
             'dataloader': train_dataset.get_dataloader(
                 batch_size=config.get('batch_size', 32),
-                num_workers=0,  # Single process először
+                num_workers=0,
                 pin_memory=True,
                 persistent_workers=False
             ),
@@ -75,7 +120,7 @@ def train(data_dir: str, output_dir: str, config_path: str):
         valid_data = {
             'dataloader': valid_dataset.get_dataloader(
                 batch_size=config.get('batch_size', 32),
-                num_workers=0,  # Single process először
+                num_workers=0,
                 pin_memory=True,
                 persistent_workers=False
             ),
@@ -87,24 +132,33 @@ def train(data_dir: str, output_dir: str, config_path: str):
         
         logger.info("Starting training...")
         history = []
-        best_valid_loss = float('inf')
-        patience = config.get('early_stopping_patience', 5)
-        patience_counter = 0
+        early_stopping = EarlyStoppingHandler(
+            patience=config.get('early_stopping_patience', 5),
+            min_delta=config.get('min_delta', 0.001),
+            alpha=0.9
+        )
         
         for epoch in range(config.get('n_epochs', 10)):
             metrics = await model.fit(train_data, valid_data)
             history.append(metrics)
             
-            valid_loss = metrics.get('valid_loss', float('inf'))
-            if valid_loss < best_valid_loss:
-                best_valid_loss = valid_loss
-                patience_counter = 0
+            # Log smoothed metrics
+            smoothed = early_stopping.smoothed_metrics
+            logger.info(f"Smoothed metrics - Val Loss: {smoothed.get('val_loss', 0):.4f}, "
+                       f"MAE: {smoothed.get('val_mae', 0):.4f}, "
+                       f"RMSE: {smoothed.get('val_rmse', 0):.4f}")
+            
+            # Save model if improved
+            combined_score = early_stopping.get_combined_score(metrics)
+            if combined_score < early_stopping.best_score:
+                logger.info(f"Model improved (score: {combined_score:.4f})")
                 model.save(output_path / 'best_model.pt')
-            else:
-                patience_counter += 1
-                if patience_counter >= patience:
-                    logger.info(f"Early stopping triggered after {epoch + 1} epochs")
-                    break
+            
+            # Check early stopping
+            if early_stopping(metrics):
+                logger.info(f"Early stopping triggered after {epoch + 1} epochs "
+                          f"(no improvement in combined score for {early_stopping.patience} epochs)")
+                break
         
         model.save(output_path / 'final_model.pt')
         plot_training_history(history, save_path=output_path / 'training_history.png')

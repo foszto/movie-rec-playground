@@ -23,7 +23,7 @@ class HybridNet(nn.Module):
                  n_items: int,
                  n_factors: int = 80,
                  llm_dim: int = 64,
-                 dropout: float = 0.5):
+                 dropout: float = 0.4):
         super().__init__()
         
         # Collaborative filtering embeddings
@@ -35,27 +35,19 @@ class HybridNet(nn.Module):
         self.user_biases = nn.Embedding(n_users, 1)
         self.item_biases = nn.Embedding(n_items, 1)
         
-        # Batch normalization
-        self.user_bn = nn.BatchNorm1d(n_factors)
-        self.item_bn = nn.BatchNorm1d(n_factors)
-        
         # LLM feature processing
         self.llm_user_projection = nn.Sequential(
             nn.Linear(llm_dim, n_factors),
-            nn.BatchNorm1d(n_factors),
+            nn.LayerNorm(n_factors),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(n_factors, n_factors),
-            nn.BatchNorm1d(n_factors)
+            nn.Dropout(dropout)
         )
         
         self.llm_item_projection = nn.Sequential(
             nn.Linear(llm_dim, n_factors),
-            nn.BatchNorm1d(n_factors),
+            nn.LayerNorm(n_factors),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(n_factors, n_factors),
-            nn.BatchNorm1d(n_factors)
+            nn.Dropout(dropout)
         )
         
         # Cross-attention mechanism
@@ -66,90 +58,20 @@ class HybridNet(nn.Module):
             batch_first=True
         )
         
-        # Fusion network with increased capacity
+        # Fusion network
         self.fusion = nn.Sequential(
             nn.Linear(n_factors * 4, n_factors * 2),
-            nn.BatchNorm1d(n_factors * 2),
+            nn.LayerNorm(n_factors * 2),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(n_factors * 2, n_factors),
-            nn.BatchNorm1d(n_factors),
+            nn.LayerNorm(n_factors),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(n_factors, 1)
         )
         
         self._init_weights()
-    
-    def _init_weights(self):
-        """Initialize model weights."""
-        nn.init.normal_(self.user_factors.weight, mean=0, std=0.01)
-        nn.init.normal_(self.item_factors.weight, mean=0, std=0.01)
-        nn.init.zeros_(self.user_biases.weight)
-        nn.init.zeros_(self.item_biases.weight)
-        
-        for module in [self.llm_user_projection, self.llm_item_projection, self.fusion]:
-            for layer in module:
-                if isinstance(layer, nn.Linear):
-                    nn.init.xavier_uniform_(layer.weight)
-                    if layer.bias is not None:
-                        nn.init.zeros_(layer.bias)
-
-    def forward(self,
-                user_ids: torch.Tensor,
-                item_ids: torch.Tensor,
-                user_llm_embeds: torch.Tensor,
-                item_llm_embeds: torch.Tensor) -> torch.Tensor:
-        """Forward pass of the hybrid model."""
-        # Get collaborative filtering embeddings with batch norm
-        user_embed = self.user_bn(self.user_factors(user_ids))
-        item_embed = self.item_bn(self.item_factors(item_ids))
-        
-        # Get bias terms
-        user_bias = self.user_biases(user_ids).squeeze(-1)
-        item_bias = self.item_biases(item_ids).squeeze(-1)
-        
-        # Project LLM embeddings
-        user_llm_proj = self.llm_user_projection(user_llm_embeds)
-        item_llm_proj = self.llm_item_projection(item_llm_embeds)
-        
-        # Compute attention between user and item embeddings
-        user_context = torch.stack([user_embed, user_llm_proj], dim=1)
-        item_context = torch.stack([item_embed, item_llm_proj], dim=1)
-        
-        attended_user, _ = self.attention(
-            user_context,
-            item_context,
-            item_context
-        )
-        
-        attended_item, _ = self.attention(
-            item_context,
-            user_context,
-            user_context
-        )
-        
-        # Element-wise interaction with strong genre emphasis
-        cf_interaction = user_embed * item_embed
-        llm_interaction = user_llm_proj * item_llm_proj * 1.5  # Increased weight for LLM features
-        
-        # Combine all features
-        combined = torch.cat([
-            cf_interaction,
-            llm_interaction,
-            attended_user.mean(dim=1),
-            attended_item.mean(dim=1)
-        ], dim=-1)
-        
-        # Final prediction
-        prediction = (
-            self.fusion(combined).squeeze(-1) +
-            user_bias +
-            item_bias +
-            self.global_bias
-        )
-        
-        return prediction
     
     def _init_weights(self):
         """Initialize model weights."""
@@ -228,64 +150,6 @@ class HybridNet(nn.Module):
         )
         
         return prediction
-class DiversityAwareLoss(nn.Module):
-    """Loss function that encourages diverse recommendations."""
-    
-    def __init__(self, diversity_lambda: float = 0.1, rating_lambda: float = 0.2):
-        super().__init__()
-        self.diversity_lambda = diversity_lambda
-        self.rating_lambda = rating_lambda
-        self.base_criterion = nn.MSELoss()
-        
-    def forward(self, pred: torch.Tensor, target: torch.Tensor, 
-                item_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Calculate loss with diversity penalty.
-        
-        Args:
-            pred: Predicted ratings
-            target: True ratings
-            item_ids: Movie IDs for the batch
-            
-        Returns:
-            Combined loss value
-        """
-        # Base prediction loss
-        base_loss = self.base_criterion(pred, target)
-        
-        # Calculate per-item statistics
-        unique_items, inverse_indices, counts = torch.unique(
-            item_ids, 
-            return_inverse=True,
-            return_counts=True
-        )
-        
-        # Get per-item average predictions
-        item_predictions = torch.zeros(
-            len(unique_items), 
-            device=pred.device
-        ).scatter_add_(
-            0, 
-            inverse_indices, 
-            pred
-        ) / counts.float()
-        
-        # Diversity loss: penalize predictions that are too similar
-        pred_std = torch.std(item_predictions)
-        diversity_loss = torch.exp(-pred_std)  # Exponential penalty for low diversity
-        
-        # Rating distribution loss: encourage using full rating range
-        rating_range = torch.max(pred) - torch.min(pred)
-        rating_loss = torch.exp(-rating_range)  # Penalize narrow rating ranges
-        
-        # Combine losses
-        total_loss = (
-            base_loss + 
-            self.diversity_lambda * diversity_loss +
-            self.rating_lambda * rating_loss
-        )
-        
-        return total_loss
 
 class HybridRecommender(BaseModel):
     """Hybrid recommender system combining collaborative filtering with LLM features."""
@@ -293,29 +157,22 @@ class HybridRecommender(BaseModel):
     def __init__(self, config: HybridConfig):
         """Initialize the hybrid recommender."""
         super().__init__(config)
-        self.l2_lambda = config.l2_reg  # L2 regularization strength
+        self.l2_lambda = config.l2_reg
         
-        # Initialize neural network with stronger regularization
+        # Initialize neural network
         self.model = HybridNet(
             n_users=config.n_users,
             n_items=config.n_items,
             n_factors=config.n_factors,
             llm_dim=config.llm_embedding_dim,
-            dropout=0.5  # Increased dropout
+            dropout=config.dropout
         ).to(self.device)
         
-        # Initialize optimizer with higher learning rate and weight decay
+        # Initialize optimizer
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
-            lr=2e-4,  # Increased learning rate
-            weight_decay=0.02  # Stronger weight decay
-        )
-        
-        # Learning rate scheduler
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=10,  # Number of epochs
-            eta_min=1e-6
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay
         )
         
         # Initialize feature extractor
@@ -324,15 +181,10 @@ class HybridRecommender(BaseModel):
             embedding_dim=config.llm_embedding_dim,
             device=config.device
         )
-
+        
         # Initialize loss function
-        self.criterion = DiversityAwareLoss(
-            diversity_lambda=0.1,
-            rating_lambda=0.2
-        ).to(self.device)
+        self.criterion = nn.MSELoss()
         
-        
-
         # Initialize mixed precision scaler
         self.scaler = torch.amp.GradScaler(self.device)
         
@@ -345,16 +197,7 @@ class HybridRecommender(BaseModel):
         # Training history and state
         self.history = []
         self.steps = 0
-        self.accumulation_steps = 4
-    
-    def _compute_l2_loss(self):
-        """Calculate L2 regularization loss for model parameters."""
-        l2_loss = 0.0
-        for name, param in self.model.named_parameters():
-            if 'weight' in name:  # Only apply to weights, not biases
-                l2_loss += torch.norm(param, p=2)
-        return l2_loss
-
+        self.accumulation_steps = 4  # Gradient accumulation steps
     
     async def _get_batch_llm_features(self,
                                     users: torch.Tensor,
@@ -404,6 +247,15 @@ class HybridRecommender(BaseModel):
             torch.stack(user_results).to(self.device),
             torch.stack(item_results).to(self.device)
         )
+    
+    def _compute_l2_loss(self):
+        """Calculate L2 regularization loss for model parameters."""
+        l2_loss = 0.0
+        for name, param in self.model.named_parameters():
+            # Csak a súlyokra alkalmazzuk, a bias-okra nem
+            if 'weight' in name:
+                l2_loss += torch.norm(param, p=2)
+        return l2_loss
 
     async def train_step(self,
                         batch: Dict[str, torch.Tensor],
@@ -411,7 +263,7 @@ class HybridRecommender(BaseModel):
                         user_history_dict: Dict,
                         user_tags_dict: Optional[Dict] = None,
                         movie_tags_dict: Optional[Dict] = None) -> float:
-        """Enhanced training step with diversity-aware loss."""
+        """Enhanced training step with L2 regularization."""
         user_ids = batch['user_id'].to(self.device)
         item_ids = batch['item_id'].to(self.device)
         ratings = batch['rating'].to(self.device)
@@ -430,8 +282,8 @@ class HybridRecommender(BaseModel):
                 item_llm_embeds
             )
             
-            # Calculate loss with diversity consideration
-            pred_loss = self.criterion(predictions, ratings, item_ids)
+            # Calculate prediction loss
+            pred_loss = self.criterion(predictions, ratings)
             
             # Add L2 regularization loss
             l2_loss = self._compute_l2_loss()
@@ -455,7 +307,6 @@ class HybridRecommender(BaseModel):
         
         self.steps += 1
         return total_loss.item() * self.accumulation_steps
-
     
     async def validate(self,
                     dataloader: torch.utils.data.DataLoader,
@@ -467,10 +318,11 @@ class HybridRecommender(BaseModel):
         all_predictions = []
         all_targets = []
         
+        # Clear GPU cache before validation
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        with torch.no_grad(), torch.amp.autocast(self.device.type):
+        with torch.no_grad(), torch.cuda.amp.autocast():
             progress_bar = tqdm(dataloader, 
                             desc="Validation batches",
                             leave=False,
@@ -495,8 +347,7 @@ class HybridRecommender(BaseModel):
                     item_llm_embeds
                 )
                 
-                # Use only base MSE loss for validation
-                loss = F.mse_loss(predictions, ratings)
+                loss = self.criterion(predictions, ratings)
                 total_loss += loss.item()
                 
                 all_predictions.extend(predictions.cpu().numpy())
@@ -504,6 +355,7 @@ class HybridRecommender(BaseModel):
                 
                 progress_bar.set_description(f"Validation (loss: {loss.item():.4f})")
         
+        # Calculate metrics
         all_predictions = np.array(all_predictions)
         all_targets = np.array(all_targets)
         
@@ -525,13 +377,14 @@ class HybridRecommender(BaseModel):
     async def fit(self,
                 train_data: Dict,
                 valid_data: Optional[Dict] = None) -> Dict[str, float]:
-        """Train the model with epoch-level scheduler step."""
+        """Train the model."""
+        # Set model to training mode at epoch start
         self.model.train()
         
         epoch_loss = 0
-        running_l2 = 0
         n_batches = len(train_data['dataloader'])
         
+        # Train loop
         progress_bar = tqdm(enumerate(train_data['dataloader']), 
                         total=n_batches,
                         desc="Training batches",
@@ -548,34 +401,13 @@ class HybridRecommender(BaseModel):
             )
             epoch_loss += loss
             
-            # Calculate L2 norm for monitoring
-            l2_norm = self._compute_l2_loss().item()
-            running_l2 += l2_norm
-            
-            current_lr = self.scheduler.get_last_lr()[0]
-            
-            # Update progress bar with detailed info
-            progress_bar.set_description(
-                f"Training (loss: {loss:.4f}, L2: {l2_norm:.4f}, lr: {current_lr:.6f})"
-            )
+            # Update progress bar
+            progress_bar.set_description(f"Training (loss: {loss:.4f})")
         
-        # Step the scheduler once per epoch
-        self.scheduler.step()
-        
-        metrics = {
-            'train_loss': epoch_loss / n_batches,
-            'l2_norm': running_l2 / n_batches,
-            'learning_rate': self.scheduler.get_last_lr()[0]
-        }
+        metrics = {'train_loss': epoch_loss / n_batches}
 
         self.logger.info(f"Epoch: {len(self.history) + 1}")
         self.logger.info(f"Epoch training loss: {metrics['train_loss']:.4f}")
-        self.logger.info(f"Average L2 norm: {metrics['l2_norm']:.4f}")
-        self.logger.info(f"Learning rate: {metrics['learning_rate']:.6f}")
-
-        # Save model after each epoch at neam checkpoint_epoch.pt
-        self.save(Path(self.config.output_dir) / f"checkpoint_{len(self.history)}.pt")
-        
         
         if valid_data:
             self.logger.info("Starting validation...")
@@ -584,10 +416,12 @@ class HybridRecommender(BaseModel):
                 valid_data['movie_info_dict'],
                 valid_data['user_history_dict']
             )
+            self.logger.info(f"Validation metrics: {val_metrics}")
             metrics.update(val_metrics)
         
         self.history.append(metrics)
         return metrics
+    
     async def predict(self,
                      user_ids: torch.Tensor,
                      item_ids: torch.Tensor,
@@ -726,7 +560,7 @@ class HybridRecommender(BaseModel):
                                      user_history_dict: Dict) -> str:
         """Generate an explanation for why a movie was recommended to a user."""
         self.model.eval()
-        with torch.no_grad(), torch.amp.autocast(self.device.type):
+        with torch.no_grad(), torch.cuda.amp.autocast():
             # Get cached embeddings if available
             user_embedding = self.feature_cache.get(f"user_{user_id}")
             movie_embedding = self.feature_cache.get(f"movie_{movie_id}")

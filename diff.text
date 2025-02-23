@@ -1,0 +1,1499 @@
+diff --git a/README.md b/README.md
+index 7db3c7f..adbab12 100644
+--- a/README.md
++++ b/README.md
+@@ -78,6 +78,8 @@ The project includes the Food.com dataset with:
+    ```bash
+    docker-compose exec dev bash
+    python main.py train --data-dir data/processed --output-dir models --config-path src/configs/model_config.yaml
++
++   python main.py train --data-dir data/processed_high --output-dir models/high --config-path src/configs/model_config.yaml
+    ```
+ 
+ ## Evaluate
+diff --git a/app.py b/app.py
+index 2ef87e2..1f99603 100644
+--- a/app.py
++++ b/app.py
+@@ -1,5 +1,4 @@
+ from fastapi import FastAPI, HTTPException
+-from torch.serialization import safe_globals
+ from fastapi.middleware.cors import CORSMiddleware
+ from pydantic import BaseModel
+ from typing import List, Dict, Optional
+@@ -7,20 +6,57 @@ import torch
+ import logging
+ from pathlib import Path
+ import asyncio
+-from datetime import datetime
+-
+-from src.models.hybrid import HybridRecommender
++from datetime import datetime, timedelta
++import numpy as np
++from torch.serialization import safe_globals
++import os
++from dotenv import load_dotenv
++from src.configs.logging_config import setup_logging
+ from src.configs.model_config import HybridConfig
++from src.models.hybrid import HybridRecommender
+ from src.utils.data_io import load_preprocessed_data
+-from src.configs.logging_config import setup_logging
++
++# Load environment variables
++load_dotenv()
++
++# Configuration from environment variables
++class Config:
++    # API Configuration
++    API_HOST = os.getenv('API_HOST', '0.0.0.0')
++    API_PORT = int(os.getenv('API_PORT', 8000))
++    DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
++    
++    # Model Configuration
++    MODEL_PATH = os.getenv('MODEL_PATH', 'models/latest_model.pt')
++    DATA_DIR = os.getenv('DATA_DIR', 'data/processed')
++    
++    # Recommendation Settings
++    TOP_K_RECOMMENDATIONS = int(os.getenv('TOP_K_RECOMMENDATIONS', 5))
++    MIN_RATING_THRESHOLD = float(os.getenv('MIN_RATING_THRESHOLD', 4.0))
++    RECENT_DAYS_THRESHOLD = int(os.getenv('RECENT_DAYS_THRESHOLD', 90))
++    
++    # Model Settings
++    DEVICE = os.getenv('DEVICE', 'cuda' if torch.cuda.is_available() else 'cpu')
++    
++    # Security
++    CORS_ORIGINS = os.getenv('CORS_ORIGINS', '*').split(',')
++    SECRET_KEY = os.getenv('SECRET_KEY', 'your-secret-key-here')
++
++    # LLM Model Settings
++    LLM_MODEL_NAME = os.getenv('LLM_MODEL_NAME', 'all-MiniLM-L6-v2')
++    LLM_EMBEDDING_DIM = int(os.getenv('LLM_EMBEDDING_DIM', 64))
++    USE_CACHED_EMBEDDINGS = os.getenv('USE_CACHED_EMBEDDINGS', 'True').lower() == 'true'
+ 
+ # Initialize FastAPI app
+-app = FastAPI(title="Movie Recommender API")
++app = FastAPI(
++    title="Enhanced Movie Recommender API",
++    debug=Config.DEBUG
++)
+ 
+ # Add CORS middleware
+ app.add_middleware(
+     CORSMiddleware,
+-    allow_origins=["*"],  # In production, replace with specific origins
++    allow_origins=Config.CORS_ORIGINS,
+     allow_credentials=True,
+     allow_methods=["*"],
+     allow_headers=["*"],
+@@ -35,18 +71,174 @@ class MovieBase(BaseModel):
+ class RatedMovie(MovieBase):
+     rating: float
+     timestamp: str
++    ratingCount: Optional[int] = None
++    similarMovies: Optional[List[str]] = None
+ 
+ class RecommendedMovie(MovieBase):
+     predictedRating: float
++    confidence: Optional[float] = None
++    reason: Optional[str] = None
++
++class UserProfile(BaseModel):
++    favoriteGenres: List[str]
++    averageRating: float
++    totalRatings: int
++    ratingDistribution: Dict[str, int]
++    recentActivity: bool
+ 
+ class RecommendationResponse(BaseModel):
+-    userHistory: List[RatedMovie]
++    userProfile: UserProfile
++    topRatedMovies: List[RatedMovie]
++    recentFavorites: List[RatedMovie]
+     recommendations: List[RecommendedMovie]
+ 
+-# Global variables for model and data
++# Global variables
+ model = None
+ movie_info_dict = None
+ user_history_dict = None
++logger = logging.getLogger(__name__)
++
++def calculate_user_profile(user_data) -> UserProfile:
++    """Calculate detailed user profile from rating history."""
++    recent_threshold = datetime.now() - timedelta(days=90)
++    
++    # Calculate rating distribution
++    ratings = user_data['rating'].value_counts().to_dict()
++    rating_dist = {str(k): int(v) for k, v in ratings.items()}
++    
++    # Calculate favorite genres
++    genre_scores = {}
++    for _, row in user_data.iterrows():
++        movie_id = int(row['movieId'])
++        if movie_id in movie_info_dict:
++            movie = movie_info_dict[movie_id]
++            rating_weight = row['rating'] / 5.0  # Normalize rating to 0-1
++            
++            for genre in movie.get('genres', []):
++                if isinstance(genre, str):
++                    genre_scores[genre] = genre_scores.get(genre, 0) + rating_weight
++    
++    # Sort genres by score
++    favorite_genres = sorted(
++        genre_scores.items(), 
++        key=lambda x: x[1], 
++        reverse=True
++    )[:5]  # Top 5 genres
++    
++    # Check recent activity
++    latest_rating = datetime.fromtimestamp(user_data['timestamp'].max())
++    is_active = latest_rating > recent_threshold
++    
++    return UserProfile(
++        favoriteGenres=[genre for genre, _ in favorite_genres],
++        averageRating=float(user_data['rating'].mean()),
++        totalRatings=len(user_data),
++        ratingDistribution=rating_dist,
++        recentActivity=is_active
++    )
++
++def get_top_rated_movies(user_data, limit: int = None) -> List[RatedMovie]:
++    """Get user's highest rated movies with additional context."""
++    limit = limit or Config.TOP_K_RECOMMENDATIONS
++    rated_movies = []
++    
++    for _, row in user_data.iterrows():
++        movie_id = int(row['movieId'])
++        if movie_id in movie_info_dict:
++            if row['rating'] >= Config.MIN_RATING_THRESHOLD:
++                movie_info = movie_info_dict[movie_id]
++                genres = movie_info.get('genres', [])
++                if isinstance(genres, str):
++                    genres = [g.strip() for g in genres.split('|')]
++                
++                rated_movies.append({
++                    'id': movie_id,
++                    'title': movie_info.get('title', 'Unknown'),
++                    'genres': genres,
++                    'rating': float(row['rating']),
++                    'timestamp': datetime.fromtimestamp(row['timestamp']).isoformat(),
++                    'ratingCount': None,
++                    'similarMovies': []
++                })
++    
++    rated_movies.sort(key=lambda x: (-x['rating'], x['timestamp']), reverse=False)
++    return rated_movies[:limit]
++
++def get_recent_favorites(user_data, limit: int = None) -> List[RatedMovie]:
++    """Get user's recent favorite movies."""
++    limit = limit or Config.TOP_K_RECOMMENDATIONS
++    cutoff_date = datetime.now() - timedelta(days=Config.RECENT_DAYS_THRESHOLD)
++    
++    recent_favorites = []
++    for _, row in user_data.iterrows():
++        rating_date = datetime.fromtimestamp(row['timestamp'])
++        if rating_date > cutoff_date and row['rating'] >= Config.MIN_RATING_THRESHOLD:
++            movie_id = int(row['movieId'])
++            if movie_id in movie_info_dict:
++                movie_info = movie_info_dict[movie_id]
++                genres = movie_info.get('genres', [])
++                if isinstance(genres, str):
++                    genres = [g.strip() for g in genres.split('|')]
++                
++                recent_favorites.append({
++                    'id': movie_id,
++                    'title': movie_info.get('title', 'Unknown'),
++                    'genres': genres,
++                    'rating': float(row['rating']),
++                    'timestamp': rating_date.isoformat()
++                })
++    
++    recent_favorites.sort(key=lambda x: x['timestamp'], reverse=True)
++    return recent_favorites[:limit]
++
++async def generate_recommendations(user_id: int, limit: int = 5) -> List[RecommendedMovie]:
++    """Generate personalized recommendations with explanations."""
++    recommendations = await model.get_top_n_recommendations(
++        user_id,
++        movie_info_dict,
++        user_history_dict,
++        n=limit,
++        exclude_watched=True
++    )
++    
++    result = []
++    for movie_id, predicted_rating in recommendations:
++        movie_info = movie_info_dict[movie_id]
++        genres = movie_info.get('genres', [])
++        if isinstance(genres, str):
++            genres = [g.strip() for g in genres.split('|')]
++            
++        # Generate explanation for the recommendation
++        user_data = user_history_dict[user_id]
++        genre_ratings = {}
++        for _, row in user_data.iterrows():
++            if row['rating'] >= 4.0:  # Only consider high ratings
++                movie_id = int(row['movieId'])
++                if movie_id in movie_info_dict:
++                    for genre in movie_info_dict[movie_id].get('genres', []):
++                        if isinstance(genre, str):
++                            genre_ratings[genre] = genre_ratings.get(genre, 0) + 1
++
++        favorite_genres = sorted(genre_ratings.items(), key=lambda x: x[1], reverse=True)[:3]
++        favorite_genres = [genre for genre, _ in favorite_genres]
++
++        # Generate simple explanation based on genres
++        matching_genres = [g for g in genres if g in favorite_genres]
++        if matching_genres:
++            explanation = f"Look this somethin familiar {', '.join(matching_genres)}"
++        else:
++            explanation = "Try this movie from a new genre!"
++        
++        result.append({
++            'id': movie_id,
++            'title': movie_info.get('title', 'Unknown'),
++            'genres': genres,
++            'predictedRating': float(predicted_rating),
++            'confidence': 0.8,  # Could be calculated based on model certainty
++            'reason': explanation
++        })
++    
++    return result
+ 
+ @app.on_event("startup")
+ async def load_model():
+@@ -55,116 +247,85 @@ async def load_model():
+     try:
+         # Setup logging
+         setup_logging()
+-        logger = logging.getLogger(__name__)
+         
+-        # Load model
+-        model_path = "models/high/final_model.pt"  # Update with your model path
+-        data_dir = "data/processed_high"  # Update with your data directory
++        if not Path(Config.MODEL_PATH).exists():
++            raise FileNotFoundError(f"Model file not found at {Config.MODEL_PATH}")
+         
+-        if not Path(model_path).exists():
+-            raise FileNotFoundError(f"Model file not found at {model_path}")
+-            
+         # Load checkpoint with fallback
+         try:
+-            # First try with weights_only=True
+-            checkpoint = torch.load(model_path, map_location=torch.device('cpu'), weights_only=True)
++            checkpoint = torch.load(
++                Config.MODEL_PATH,
++                map_location=torch.device(Config.DEVICE),
++                weights_only=True
++            )
+             logger.info("Model loaded with weights_only=True")
+         except Exception as e:
+             logger.warning("Could not load with weights_only=True, trying with weights_only=False")
+-            # If that fails, try with weights_only=False
+             with safe_globals([HybridConfig]):
+-                checkpoint = torch.load(model_path, map_location=torch.device('cpu'), weights_only=False)
++                checkpoint = torch.load(
++                    Config.MODEL_PATH,
++                    map_location=torch.device(Config.DEVICE),
++                    weights_only=False
++                )
+             logger.info("Model loaded with weights_only=False")
+-            
+-        config = HybridConfig(**checkpoint['config'])
++        
++        # Update config with environment settings
++        config_dict = checkpoint['config']
++        config_dict.update({
++            'device': Config.DEVICE,
++            'llm_model_name': Config.LLM_MODEL_NAME,
++            'llm_embedding_dim': Config.LLM_EMBEDDING_DIM,
++        })
++        
++        config = HybridConfig(**config_dict)
+         
+         # Initialize and load model
+         model = HybridRecommender(config)
+-        model.load(model_path)
+-        logger.info("Model loaded successfully")
++        model.load(Config.MODEL_PATH)
++        logger.info("Model initialized successfully")
+         
+         # Load data
+         logger.info("Loading preprocessed data...")
+-        _, _, _, user_history_dict, movie_info_dict, _, _ = load_preprocessed_data(data_dir)
++        _, _, _, user_history_dict, movie_info_dict, _, _ = load_preprocessed_data(Config.DATA_DIR)
+         logger.info("Data loaded successfully")
+         
+     except Exception as e:
+         logger.error(f"Error during startup: {str(e)}")
+         raise
+ 
+-def format_movie_info(movie_id: int, movie_info: Dict, rating: Optional[float] = None, 
+-                     timestamp: Optional[str] = None) -> Dict:
+-    """Helper function to format movie information."""
+-    genres = movie_info.get('genres', [])
+-    if isinstance(genres, str):
+-        genres = [g.strip() for g in genres.split('|')]
+-    
+-    movie_dict = {
+-        "id": movie_id,
+-        "title": movie_info.get('title', 'Unknown Title'),
+-        "genres": genres
+-    }
+-    
+-    if rating is not None:
+-        movie_dict["rating"] = float(rating)
+-    if timestamp is not None:
+-        movie_dict["timestamp"] = timestamp
+-        
+-    return movie_dict
+-
+ @app.get("/api/recommendations/{user_id}", response_model=RecommendationResponse)
+-async def get_recommendations(user_id: int, limit: int = 5):
++async def get_recommendations(
++    user_id: int,
++    limit: int = Config.TOP_K_RECOMMENDATIONS
++):
+     try:
+-        # Validate user exists
+         if user_id not in user_history_dict:
+             raise HTTPException(status_code=404, detail="User not found")
+         
+-        # Get user history
+         user_data = user_history_dict[user_id]
+         
+-        # Format user history
+-        history = []
+-        for _, row in user_data.iterrows():
+-            movie_id = int(row['movieId'])
+-            if movie_id in movie_info_dict:
+-                movie = format_movie_info(
+-                    movie_id,
+-                    movie_info_dict[movie_id],
+-                    rating=row['rating'],
+-                    timestamp=datetime.fromtimestamp(row['timestamp']).isoformat()
+-                )
+-                history.append(movie)
+-        
+-        # Sort history by timestamp (newest first) and limit
+-        history.sort(key=lambda x: x['timestamp'], reverse=True)
+-        history = history[:limit]
+-        
+-        # Get recommendations
+-        recommendations = await model.get_top_n_recommendations(
+-            user_id,
+-            movie_info_dict,
+-            user_history_dict,
+-            n=limit,
+-            exclude_watched=True
+-        )
+-        
+-        # Format recommendations
+-        recommended_movies = []
+-        for movie_id, predicted_rating in recommendations:
+-            if movie_id in movie_info_dict:
+-                movie = format_movie_info(movie_id, movie_info_dict[movie_id])
+-                movie["predictedRating"] = float(predicted_rating)
+-                recommended_movies.append(movie)
++        # Generate all components in parallel
++        recommendations = await generate_recommendations(user_id, limit)
++        top_rated = get_top_rated_movies(user_data, limit)
++        recent_favorites = get_recent_favorites(user_data, limit)
++        user_profile = calculate_user_profile(user_data)
+         
+         return {
+-            "userHistory": history,
+-            "recommendations": recommended_movies
++            "userProfile": user_profile,
++            "topRatedMovies": top_rated,
++            "recentFavorites": recent_favorites,
++            "recommendations": recommendations
+         }
+         
+     except Exception as e:
+-        logging.error(f"Error generating recommendations: {str(e)}")
++        logger.error(f"Error generating recommendations: {str(e)}")
+         raise HTTPException(status_code=500, detail="Error generating recommendations")
+-
++    
+ if __name__ == "__main__":
+     import uvicorn
+-    uvicorn.run(app, host="0.0.0.0", port=8000)
+\ No newline at end of file
++    uvicorn.run(
++        app,
++        host=Config.API_HOST,
++        port=Config.API_PORT,
++        log_level="debug" if Config.DEBUG else "info"
++    )
+\ No newline at end of file
+diff --git a/frontend/src/components/MovieRecommender.js b/frontend/src/components/MovieRecommender.js
+index 52ca1b3..9654f8d 100755
+--- a/frontend/src/components/MovieRecommender.js
++++ b/frontend/src/components/MovieRecommender.js
+@@ -1,11 +1,10 @@
+ import React, { useState } from 'react';
+-import { Loader2, Star, StarHalf, Search, Calendar, Clock } from 'lucide-react';
++import { Loader2, Star, StarHalf, Search, Clock, Award, TrendingUp } from 'lucide-react';
+ 
+ const MovieRecommender = () => {
+   const [userId, setUserId] = useState('');
+   const [selectedUser, setSelectedUser] = useState(null);
+-  const [userHistory, setUserHistory] = useState([]);
+-  const [recommendations, setRecommendations] = useState([]);
++  const [userData, setUserData] = useState(null);
+   const [loading, setLoading] = useState(false);
+   const [error, setError] = useState(null);
+ 
+@@ -27,8 +26,7 @@ const MovieRecommender = () => {
+       const data = await response.json();
+       
+       setSelectedUser(userId);
+-      setUserHistory(data.userHistory);
+-      setRecommendations(data.recommendations);
++      setUserData(data);
+     } catch (error) {
+       setError(error.message);
+       console.error('Error:', error);
+@@ -42,155 +40,179 @@ const MovieRecommender = () => {
+     const hasHalfStar = rating % 1 >= 0.5;
+     
+     return (
+-      <div className="flex items-center space-x-1">
++      <div className="flex items-center">
+         {[...Array(fullStars)].map((_, i) => (
+-          <Star key={i} className="w-5 h-5 text-yellow-400 fill-yellow-400" />
++          <Star key={i} className="w-4 h-4 text-yellow-400 fill-yellow-400" />
+         ))}
+-        {hasHalfStar && <StarHalf className="w-5 h-5 text-yellow-400 fill-yellow-400" />}
+-        <span className="ml-2 text-sm font-medium text-gray-600">({rating.toFixed(1)})</span>
++        {hasHalfStar && <StarHalf className="w-4 h-4 text-yellow-400 fill-yellow-400" />}
++        <span className="ml-1 text-sm">({rating.toFixed(1)})</span>
+       </div>
+     );
+   };
+ 
+   const MovieBox = ({ movie, type }) => (
+-    <div className="group relative overflow-hidden rounded-xl bg-gradient-to-br from-white to-gray-50 shadow-md hover:shadow-xl transition-all duration-300 p-6">
+-      {/* Háttér dekoráció */}
+-      <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-br from-blue-50 to-transparent rounded-bl-full opacity-30 transition-transform group-hover:scale-150 duration-500"></div>
+-      
+-      {/* Film címe és típus jelző */}
+-      <div className="relative">
+-        <div className="flex items-start justify-between mb-3">
+-          <h4 className="font-bold text-xl text-gray-800 group-hover:text-blue-600 transition-colors">
+-            {movie.title}
+-          </h4>
+-          {type === 'recommendation' && (
+-            <span className="px-3 py-1 bg-blue-100 text-blue-600 text-xs font-semibold rounded-full">
+-              Ajánlott
++    <div className="flex flex-col border rounded-lg bg-white p-4 shadow-sm hover:shadow-md transition-shadow">
++      <h4 className="font-medium text-lg mb-2">{movie.title}</h4>
++      <div className="text-sm text-gray-600 mb-2">
++        {movie.genres.join(', ')}
++      </div>
++      <div className="mt-auto space-y-2">
++        <div className="flex items-center justify-between">
++          <RatingStars rating={type === 'recommendation' ? movie.predictedRating : movie.rating} />
++          {type === 'history' && (
++            <span className="text-xs text-gray-500">
++              {new Date(movie.timestamp).toLocaleDateString()}
+             </span>
+           )}
+         </div>
++        {movie.reason && (
++          <p className="text-sm text-gray-600 mt-2 border-t pt-2">
++            {movie.reason}
++          </p>
++        )}
++      </div>
++    </div>
++  );
+ 
+-        {/* Műfajok */}
+-        <div className="flex flex-wrap gap-2 mb-4">
+-          {movie.genres.map((genre, index) => (
+-            <span 
+-              key={index}
+-              className="px-2 py-1 bg-gray-100 text-gray-600 text-xs rounded-lg hover:bg-gray-200 transition-colors"
+-            >
+-              {genre}
+-            </span>
+-          ))}
++  const UserProfile = ({ profile }) => (
++    <div className="bg-white rounded-xl shadow-sm p-6 border border-gray-100 mb-8">
++      <h2 className="text-xl font-semibold mb-4">Felhasználói Profil</h2>
++      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
++        <div>
++          <h3 className="font-medium mb-2">Kedvenc műfajok</h3>
++          <div className="flex flex-wrap gap-2">
++            {profile.favoriteGenres.map(genre => (
++              <span key={genre} className="px-3 py-1 bg-blue-50 text-blue-700 rounded-full text-sm">
++                {genre}
++              </span>
++            ))}
++          </div>
+         </div>
+-
+-        {/* Értékelés és időbélyeg */}
+-        <div className="mt-4 pt-4 border-t border-gray-100 flex items-center justify-between">
+-          <RatingStars rating={type === 'recommendation' ? movie.predictedRating : movie.rating} />
+-          
+-          {type === 'history' && (
+-            <div className="flex items-center text-gray-500">
+-              <Calendar className="w-4 h-4 mr-1" />
+-              <span className="text-sm">
+-                {new Date(movie.timestamp).toLocaleDateString()}
++        <div>
++          <h3 className="font-medium mb-2">Statisztika</h3>
++          <div className="space-y-2 text-sm">
++            <div className="flex items-center justify-between">
++              <span>Átlagos értékelés:</span>
++              <span className="font-medium">{profile.averageRating.toFixed(1)}</span>
++            </div>
++            <div className="flex items-center justify-between">
++              <span>Összes értékelés:</span>
++              <span className="font-medium">{profile.totalRatings}</span>
++            </div>
++            <div className="flex items-center justify-between">
++              <span>Aktivitás:</span>
++              <span className={`font-medium ${profile.recentActivity ? 'text-green-600' : 'text-gray-500'}`}>
++                {profile.recentActivity ? 'Aktív' : 'Inaktív'}
+               </span>
+             </div>
+-          )}
++          </div>
+         </div>
+       </div>
+     </div>
+   );
+ 
++  const MovieSection = ({ title, movies, type, icon: Icon }) => (
++    <div className="border rounded-xl p-6 bg-white shadow-sm mb-6">
++      <div className="flex items-center gap-2 mb-4">
++        <Icon className="w-5 h-5 text-blue-600" />
++        <h2 className="text-xl font-semibold">{title}</h2>
++        <span className="text-sm text-gray-600 ml-auto">({movies.length} film)</span>
++      </div>
++      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
++        {movies.map(movie => (
++          <MovieBox key={movie.id} movie={movie} type={type} />
++        ))}
++      </div>
++    </div>
++  );
++
+   return (
+-    <div className="max-w-6xl mx-auto p-6 bg-gray-50">
+-      <div className="text-center mb-12">
+-        <h1 className="text-4xl font-bold mb-4 bg-gradient-to-r from-blue-600 to-blue-800 bg-clip-text text-transparent">
+-          MovieLens Film Ajánló
+-        </h1>
+-        <div className="max-w-md mx-auto bg-white rounded-2xl shadow-lg p-8 border border-gray-100">
+-          <form onSubmit={handleSearch} className="flex flex-col sm:flex-row gap-4">
+-            <div className="flex-grow">
+-              <div className="relative">
+-                <input
+-                  type="number"
+-                  value={userId}
+-                  onChange={(e) => setUserId(e.target.value)}
+-                  placeholder="Adja meg a felhasználó ID-t..."
+-                  className="w-full pl-4 pr-10 py-3 border-2 border-gray-200 rounded-lg 
+-                           focus:outline-none focus:border-blue-500 transition-colors
+-                           text-gray-800 placeholder-gray-400
+-                           bg-gray-50 hover:bg-white focus:bg-white"
+-                  min="1"
+-                />
+-                <div className="absolute inset-y-0 right-3 flex items-center pointer-events-none">
+-                  <span className="text-gray-400">ID</span>
++    <div className="min-h-screen bg-gray-50 py-8">
++      <div className="max-w-6xl mx-auto px-4">
++        <div className="text-center mb-8">
++          <h1 className="text-3xl font-bold mb-8 text-gray-800">MovieLens Film Ajánló</h1>
++          <div className="max-w-md mx-auto bg-white rounded-xl shadow-md p-6 border border-gray-100">
++            <form onSubmit={handleSearch} className="flex flex-col sm:flex-row gap-4">
++              <div className="flex-grow">
++                <div className="relative">
++                  <input
++                    type="number"
++                    value={userId}
++                    onChange={(e) => setUserId(e.target.value)}
++                    placeholder="Adja meg a felhasználó ID-t..."
++                    className="w-full pl-4 pr-10 py-3 border-2 border-gray-200 rounded-lg 
++                             focus:outline-none focus:border-blue-500 transition-colors
++                             text-gray-800 placeholder-gray-400
++                             bg-gray-50 hover:bg-white focus:bg-white"
++                    min="1"
++                  />
++                  <div className="absolute inset-y-0 right-3 flex items-center pointer-events-none">
++                    <span className="text-gray-400">ID</span>
++                  </div>
+                 </div>
+               </div>
+-            </div>
+-            <button
+-              type="submit"
+-              disabled={loading}
+-              className="px-6 py-3 bg-gradient-to-r from-blue-600 to-blue-700 
+-                       text-white rounded-lg hover:from-blue-700 hover:to-blue-800 
+-                       disabled:from-blue-300 disabled:to-blue-400
+-                       transform transition-all duration-200 hover:scale-105
+-                       flex items-center justify-center gap-2 shadow-md
+-                       min-w-[120px]"
+-            >
+-              {loading ? (
+-                <Loader2 className="w-5 h-5 animate-spin" />
+-              ) : (
+-                <>
+-                  <Search className="w-5 h-5" />
+-                  <span>Keresés</span>
+-                </>
+-              )}
+-            </button>
+-          </form>
+-        </div>
+-      </div>
+-
+-      {error && (
+-        <div className="p-4 mb-6 bg-red-50 text-red-600 rounded-lg border border-red-200 shadow-sm">
+-          {error}
+-        </div>
+-      )}
+-
+-      {loading && (
+-        <div className="flex justify-center items-center py-12">
+-          <Loader2 className="w-12 h-12 animate-spin text-blue-600" />
++              <button
++                type="submit"
++                disabled={loading}
++                className="px-6 py-3 bg-gradient-to-r from-blue-600 to-blue-700 
++                         text-white rounded-lg hover:from-blue-700 hover:to-blue-800 
++                         disabled:from-blue-300 disabled:to-blue-400
++                         transform transition-all duration-200 hover:scale-105
++                         flex items-center justify-center gap-2 shadow-sm
++                         min-w-[120px]"
++              >
++                {loading ? (
++                  <Loader2 className="w-5 h-5 animate-spin" />
++                ) : (
++                  <>
++                    <Search className="w-5 h-5" />
++                    <span>Keresés</span>
++                  </>
++                )}
++              </button>
++            </form>
++          </div>
+         </div>
+-      )}
+ 
+-      {selectedUser && !loading && (
+-        <div className="space-y-12">
+-          <div className="rounded-2xl p-8 bg-white shadow-lg border border-gray-100">
+-            <div className="flex items-center justify-between mb-6">
+-              <h2 className="text-2xl font-bold text-gray-800">Személyre szabott ajánlások</h2>
+-              <span className="px-4 py-2 bg-blue-50 text-blue-600 rounded-full text-sm font-medium">
+-                {recommendations.length} film
+-              </span>
+-            </div>
+-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+-              {recommendations.map(movie => (
+-                <MovieBox key={movie.id} movie={movie} type="recommendation" />
+-              ))}
+-            </div>
++        {error && (
++          <div className="p-4 mb-6 bg-red-50 text-red-600 rounded-lg border border-red-200">
++            {error}
+           </div>
++        )}
+ 
+-          <div className="rounded-2xl p-8 bg-white shadow-lg border border-gray-100">
+-            <div className="flex items-center justify-between mb-6">
+-              <h2 className="text-2xl font-bold text-gray-800">Korábbi értékelések</h2>
+-              <span className="px-4 py-2 bg-gray-50 text-gray-600 rounded-full text-sm font-medium">
+-                {userHistory.length} film
+-              </span>
+-            </div>
+-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+-              {userHistory.map(movie => (
+-                <MovieBox key={movie.id} movie={movie} type="history" />
+-              ))}
+-            </div>
++        {loading && (
++          <div className="flex justify-center items-center py-12">
++            <Loader2 className="w-10 h-10 animate-spin text-blue-600" />
+           </div>
+-        </div>
+-      )}
++        )}
++
++        {userData && !loading && (
++          <>
++            <UserProfile profile={userData.userProfile} />
++            
++            <MovieSection
++              title="Személyre szabott ajánlások"
++              movies={userData.recommendations}
++              type="recommendation"
++              icon={TrendingUp}
++            />
++            
++            <MovieSection
++              title="Legjobban értékelt filmek"
++              movies={userData.topRatedMovies}
++              type="history"
++              icon={Award}
++            />
++            
++            <MovieSection
++              title="Legutóbbi kedvencek"
++              movies={userData.recentFavorites}
++              type="history"
++              icon={Clock}
++            />
++          </>
++        )}
++      </div>
+     </div>
+   );
+ };
+diff --git a/src/cli/train.py b/src/cli/train.py
+index 161f7ca..7a9c981 100644
+--- a/src/cli/train.py
++++ b/src/cli/train.py
+@@ -13,6 +13,52 @@ from src.models.hybrid import HybridRecommender
+ from src.utils.data_io import load_preprocessed_data
+ from src.utils.visualization import plot_training_history
+ 
++
++class EarlyStoppingHandler:
++    """Enhanced early stopping with multiple metrics and smoothing."""
++    
++    def __init__(self, patience: int = 5, min_delta: float = 0.001, alpha: float = 0.9):
++        self.patience = patience
++        self.min_delta = min_delta
++        self.alpha = alpha  # smoothing factor
++        self.best_score = float('inf')
++        self.counter = 0
++        self.smoothed_metrics = {}
++    
++    def update_smoothed_metrics(self, metrics: dict) -> dict:
++        """Update exponential moving average of metrics."""
++        if not self.smoothed_metrics:
++            self.smoothed_metrics = metrics.copy()
++        else:
++            for key, value in metrics.items():
++                if key in self.smoothed_metrics:
++                    self.smoothed_metrics[key] = (
++                        self.alpha * self.smoothed_metrics[key] +
++                        (1 - self.alpha) * value
++                    )
++        return self.smoothed_metrics
++    
++    def get_combined_score(self, metrics: dict) -> float:
++        """Calculate combined score from multiple metrics."""
++        smoothed = self.update_smoothed_metrics(metrics)
++        return (
++            smoothed.get('val_loss', 0) * 0.4 +
++            smoothed.get('val_mae', 0) * 0.3 +
++            smoothed.get('val_rmse', 0) * 0.3
++        )
++    
++    def __call__(self, metrics: dict) -> bool:
++        """Check if training should stop."""
++        score = self.get_combined_score(metrics)
++        
++        if score < self.best_score - self.min_delta:
++            self.best_score = score
++            self.counter = 0
++            return False
++        
++        self.counter += 1
++        return self.counter >= self.patience
++
+ # Set multiprocessing start method
+ mp.set_start_method('spawn', force=True)
+ 
+@@ -58,11 +104,10 @@ def train(data_dir: str, output_dir: str, config_path: str):
+         
+         model = HybridRecommender(model_config)
+         
+-        # Módosított DataLoader konfigurációk
+         train_data = {
+             'dataloader': train_dataset.get_dataloader(
+                 batch_size=config.get('batch_size', 32),
+-                num_workers=0,  # Single process először
++                num_workers=0,
+                 pin_memory=True,
+                 persistent_workers=False
+             ),
+@@ -75,7 +120,7 @@ def train(data_dir: str, output_dir: str, config_path: str):
+         valid_data = {
+             'dataloader': valid_dataset.get_dataloader(
+                 batch_size=config.get('batch_size', 32),
+-                num_workers=0,  # Single process először
++                num_workers=0,
+                 pin_memory=True,
+                 persistent_workers=False
+             ),
+@@ -87,24 +132,33 @@ def train(data_dir: str, output_dir: str, config_path: str):
+         
+         logger.info("Starting training...")
+         history = []
+-        best_valid_loss = float('inf')
+-        patience = config.get('early_stopping_patience', 5)
+-        patience_counter = 0
++        early_stopping = EarlyStoppingHandler(
++            patience=config.get('early_stopping_patience', 5),
++            min_delta=config.get('min_delta', 0.001),
++            alpha=0.9
++        )
+         
+         for epoch in range(config.get('n_epochs', 10)):
+             metrics = await model.fit(train_data, valid_data)
+             history.append(metrics)
+             
+-            valid_loss = metrics.get('valid_loss', float('inf'))
+-            if valid_loss < best_valid_loss:
+-                best_valid_loss = valid_loss
+-                patience_counter = 0
++            # Log smoothed metrics
++            smoothed = early_stopping.smoothed_metrics
++            logger.info(f"Smoothed metrics - Val Loss: {smoothed.get('val_loss', 0):.4f}, "
++                       f"MAE: {smoothed.get('val_mae', 0):.4f}, "
++                       f"RMSE: {smoothed.get('val_rmse', 0):.4f}")
++            
++            # Save model if improved
++            combined_score = early_stopping.get_combined_score(metrics)
++            if combined_score < early_stopping.best_score:
++                logger.info(f"Model improved (score: {combined_score:.4f})")
+                 model.save(output_path / 'best_model.pt')
+-            else:
+-                patience_counter += 1
+-                if patience_counter >= patience:
+-                    logger.info(f"Early stopping triggered after {epoch + 1} epochs")
+-                    break
++            
++            # Check early stopping
++            if early_stopping(metrics):
++                logger.info(f"Early stopping triggered after {epoch + 1} epochs "
++                          f"(no improvement in combined score for {early_stopping.patience} epochs)")
++                break
+         
+         model.save(output_path / 'final_model.pt')
+         plot_training_history(history, save_path=output_path / 'training_history.png')
+diff --git a/src/configs/model_config.yaml b/src/configs/model_config.yaml
+index 29b70c1..1ce9da4 100644
+--- a/src/configs/model_config.yaml
++++ b/src/configs/model_config.yaml
+@@ -3,14 +3,15 @@ random_seed: 42
+ valid_ratio: 0.2
+ batch_size: 64
+ n_epochs: 10
+-early_stopping_patience: 3
++early_stopping_patience: 4
+ 
+ # Model parameters
+ model_params:
+-  n_factors: 80
+-  learning_rate: 0.0005
+-  dropout: 0.3
+-  weight_decay: 0.01
++  n_factors: 100
++  learning_rate: 2e-4
++  dropout: 0.5
++  weight_decay: 0.02
++  l2_reg: 0.01
+   max_grad_norm: 1.0
+   device: "cuda"  # or "cpu"
+ 
+diff --git a/src/llm/feature_extractor.py b/src/llm/feature_extractor.py
+index 08c8757..ff0098e 100644
+--- a/src/llm/feature_extractor.py
++++ b/src/llm/feature_extractor.py
+@@ -52,29 +52,44 @@ class LLMFeatureExtractor:
+         self.genre_processor = OptimizedGenreProcessor()
+     
+     async def process_user_tags(self, user_tags: pd.DataFrame) -> torch.Tensor:
+-        """Process user tags to create tag-based user profile."""
++        """Process user tags with enhanced genre focus."""
+         self.logger.info("Processing user tags...")
+         torch.set_grad_enabled(False)
+         torch.set_default_device(self.device)
++        
+         if user_tags.empty:
+             return torch.zeros(self.embedding_dim, device=self.device)
+             
+-        # Aggregate tags by frequency
+-        tag_counts = user_tags['tag'].value_counts()
+-        top_tags = tag_counts.head(10).index.tolist()
++        # Weight tags based on their relevance to genres
++        genre_related_tags = {
++            'action', 'adventure', 'animation', 'comedy', 'crime', 'documentary',
++            'drama', 'family', 'fantasy', 'horror', 'mystery', 'romance', 'sci-fi',
++            'thriller', 'war', 'western'
++        }
++        
++        # Add weight column based on genre relevance
++        user_tags['weight'] = user_tags['tag'].apply(
++            lambda x: 2.0 if x.lower() in genre_related_tags else 1.0
++        )
++        
++        # Aggregate tags by weighted frequency
++        tag_weights = user_tags.groupby('tag')['weight'].sum()
++        top_tags = tag_weights.nlargest(15).index.tolist()  # Increased from 10 to 15
+         
+         # Get embeddings for top tags
+         tag_embeddings = []
++        weights = []
+         for tag in top_tags:
+             embedding = self.model.encode(tag, convert_to_tensor=True).to(self.device)
+             tag_embeddings.append(embedding)
++            weights.append(tag_weights[tag])
+             
+         if not tag_embeddings:
+             return torch.zeros(self.embedding_dim, device=self.device)
+             
+-        # Stack and process tag embeddings
+-        tag_tensor = torch.stack(tag_embeddings).device(self.device)
+-        tag_weights = torch.softmax(torch.tensor(tag_counts[:len(tag_embeddings)]), dim=0).device(self.device)
++        # Stack and process tag embeddings with emphasis on genre-related tags
++        tag_tensor = torch.stack(tag_embeddings).to(self.device)
++        tag_weights = torch.softmax(torch.tensor(weights), dim=0).to(self.device)
+         
+         # Project to lower dimension
+         projected_tags = self.tag_embedding(tag_tensor)
+@@ -141,27 +156,64 @@ class LLMFeatureExtractor:
+         if user_tags is not None and not user_tags.empty:
+             tag_embedding = await self.process_user_tags(user_tags)
+             # Combine embeddings with equal weights
+-            combined = (base_embedding + tag_embedding) / 2
++            combined = (base_embedding * 0.7 + tag_embedding * 0.3) / 2
+             return F.normalize(combined, p=2, dim=0)
+         
+         return base_embedding
+     
+     async def _get_base_user_embedding(self, user_history: pd.DataFrame) -> torch.Tensor:
+-        """Generate base user embedding with optimized genre processing."""
++        """Generate base user embedding with enhanced genre focus."""
+         # Check cache
+         cache_key = f"user_{len(user_history)}_{user_history['timestamp'].max()}_{user_history['rating'].mean()}"
+         if cache_key in self.embedding_cache:
+             return self.embedding_cache[cache_key]
+         
+-        # Get genre preferences
++        # Weight movies based on ratings
++        user_history['weight'] = user_history['rating'].apply(
++            lambda x: 2.0 if x >= 4.0 else (0.5 if x <= 2.0 else 1.0)
++        )
++        
++        # Get genre preferences with weighted history
+         genre_preferences = self.genre_processor.get_genre_preferences(user_history)
+-        genre_text = self.genre_processor.generate_genre_feature_text(genre_preferences)
+         
+-        # Get basic viewing stats - only calculate what's needed
++        # Generate detailed genre text with emphasis on highly rated genres
++        top_genres = sorted(
++            [(g, genre_preferences['genre_scores'][g]) 
++             for g in genre_preferences['liked_genres']],
++            key=lambda x: x[1],
++            reverse=True
++        )[:5]
++        
++        # Create detailed genre descriptions
++        genre_descriptions = []
++        for genre, score in top_genres:
++            similar_genres = genre_preferences['similar_genres'].get(genre, [])
++            similar_text = f" (similar to {', '.join(g['genre'] for g in similar_genres[:2])})" if similar_genres else ""
++            genre_descriptions.append(
++                f"Strong preference for {genre} (score: {score:.2f}){similar_text}"
++            )
++        
++        # Calculate recent activity using timestamp as integer
++        max_timestamp = user_history['timestamp'].max()
++        # 90 days in seconds: 90 * 24 * 60 * 60 = 7776000
++        recent_threshold = max_timestamp - 7776000
++        recent_ratings = user_history[user_history['timestamp'] > recent_threshold]
++        recent_high_ratings = recent_ratings[recent_ratings['rating'] >= 4.0]
++        
++        # Generate comprehensive profile text
+         profile_text = f"""
+-        {genre_text}
+-        Total ratings: {len(user_history)}
++        User Genre Preferences:
++        {chr(10).join(genre_descriptions)}
++        
++        Recent Activity (last 90 days):
++        Total ratings: {len(recent_ratings)}
++        High ratings (4+): {len(recent_high_ratings)}
++        Average rating: {recent_ratings['rating'].mean():.2f}
++        
++        Overall Stats:
++        Total movies rated: {len(user_history)}
+         Average rating: {user_history['rating'].mean():.2f}
++        Rating spread: {user_history['rating'].std():.2f}
+         """
+         
+         # Get embedding
+@@ -243,4 +295,4 @@ class LLMFeatureExtractor:
+         self.genre_processor.genre_cache.clear()
+         self.genre_processor.similarity_cache.clear()
+         self.genre_processor.cache_key = None
+-        self.logger.info("All caches cleared")
++        self.logger.info("All caches cleared")
+\ No newline at end of file
+diff --git a/src/models/hybrid.py b/src/models/hybrid.py
+index 8c0fe72..c10daec 100644
+--- a/src/models/hybrid.py
++++ b/src/models/hybrid.py
+@@ -23,7 +23,7 @@ class HybridNet(nn.Module):
+                  n_items: int,
+                  n_factors: int = 80,
+                  llm_dim: int = 64,
+-                 dropout: float = 0.4):
++                 dropout: float = 0.5):
+         super().__init__()
+         
+         # Collaborative filtering embeddings
+@@ -35,19 +35,27 @@ class HybridNet(nn.Module):
+         self.user_biases = nn.Embedding(n_users, 1)
+         self.item_biases = nn.Embedding(n_items, 1)
+         
++        # Batch normalization
++        self.user_bn = nn.BatchNorm1d(n_factors)
++        self.item_bn = nn.BatchNorm1d(n_factors)
++        
+         # LLM feature processing
+         self.llm_user_projection = nn.Sequential(
+             nn.Linear(llm_dim, n_factors),
+-            nn.LayerNorm(n_factors),
++            nn.BatchNorm1d(n_factors),
+             nn.ReLU(),
+-            nn.Dropout(dropout)
++            nn.Dropout(dropout),
++            nn.Linear(n_factors, n_factors),
++            nn.BatchNorm1d(n_factors)
+         )
+         
+         self.llm_item_projection = nn.Sequential(
+             nn.Linear(llm_dim, n_factors),
+-            nn.LayerNorm(n_factors),
++            nn.BatchNorm1d(n_factors),
+             nn.ReLU(),
+-            nn.Dropout(dropout)
++            nn.Dropout(dropout),
++            nn.Linear(n_factors, n_factors),
++            nn.BatchNorm1d(n_factors)
+         )
+         
+         # Cross-attention mechanism
+@@ -58,14 +66,14 @@ class HybridNet(nn.Module):
+             batch_first=True
+         )
+         
+-        # Fusion network
++        # Fusion network with increased capacity
+         self.fusion = nn.Sequential(
+             nn.Linear(n_factors * 4, n_factors * 2),
+-            nn.LayerNorm(n_factors * 2),
++            nn.BatchNorm1d(n_factors * 2),
+             nn.ReLU(),
+             nn.Dropout(dropout),
+             nn.Linear(n_factors * 2, n_factors),
+-            nn.LayerNorm(n_factors),
++            nn.BatchNorm1d(n_factors),
+             nn.ReLU(),
+             nn.Dropout(dropout),
+             nn.Linear(n_factors, 1)
+@@ -73,6 +81,76 @@ class HybridNet(nn.Module):
+         
+         self._init_weights()
+     
++    def _init_weights(self):
++        """Initialize model weights."""
++        nn.init.normal_(self.user_factors.weight, mean=0, std=0.01)
++        nn.init.normal_(self.item_factors.weight, mean=0, std=0.01)
++        nn.init.zeros_(self.user_biases.weight)
++        nn.init.zeros_(self.item_biases.weight)
++        
++        for module in [self.llm_user_projection, self.llm_item_projection, self.fusion]:
++            for layer in module:
++                if isinstance(layer, nn.Linear):
++                    nn.init.xavier_uniform_(layer.weight)
++                    if layer.bias is not None:
++                        nn.init.zeros_(layer.bias)
++
++    def forward(self,
++                user_ids: torch.Tensor,
++                item_ids: torch.Tensor,
++                user_llm_embeds: torch.Tensor,
++                item_llm_embeds: torch.Tensor) -> torch.Tensor:
++        """Forward pass of the hybrid model."""
++        # Get collaborative filtering embeddings with batch norm
++        user_embed = self.user_bn(self.user_factors(user_ids))
++        item_embed = self.item_bn(self.item_factors(item_ids))
++        
++        # Get bias terms
++        user_bias = self.user_biases(user_ids).squeeze(-1)
++        item_bias = self.item_biases(item_ids).squeeze(-1)
++        
++        # Project LLM embeddings
++        user_llm_proj = self.llm_user_projection(user_llm_embeds)
++        item_llm_proj = self.llm_item_projection(item_llm_embeds)
++        
++        # Compute attention between user and item embeddings
++        user_context = torch.stack([user_embed, user_llm_proj], dim=1)
++        item_context = torch.stack([item_embed, item_llm_proj], dim=1)
++        
++        attended_user, _ = self.attention(
++            user_context,
++            item_context,
++            item_context
++        )
++        
++        attended_item, _ = self.attention(
++            item_context,
++            user_context,
++            user_context
++        )
++        
++        # Element-wise interaction with strong genre emphasis
++        cf_interaction = user_embed * item_embed
++        llm_interaction = user_llm_proj * item_llm_proj * 1.5  # Increased weight for LLM features
++        
++        # Combine all features
++        combined = torch.cat([
++            cf_interaction,
++            llm_interaction,
++            attended_user.mean(dim=1),
++            attended_item.mean(dim=1)
++        ], dim=-1)
++        
++        # Final prediction
++        prediction = (
++            self.fusion(combined).squeeze(-1) +
++            user_bias +
++            item_bias +
++            self.global_bias
++        )
++        
++        return prediction
++    
+     def _init_weights(self):
+         """Initialize model weights."""
+         nn.init.normal_(self.user_factors.weight, mean=0, std=0.01)
+@@ -150,6 +228,64 @@ class HybridNet(nn.Module):
+         )
+         
+         return prediction
++class DiversityAwareLoss(nn.Module):
++    """Loss function that encourages diverse recommendations."""
++    
++    def __init__(self, diversity_lambda: float = 0.1, rating_lambda: float = 0.2):
++        super().__init__()
++        self.diversity_lambda = diversity_lambda
++        self.rating_lambda = rating_lambda
++        self.base_criterion = nn.MSELoss()
++        
++    def forward(self, pred: torch.Tensor, target: torch.Tensor, 
++                item_ids: torch.Tensor) -> torch.Tensor:
++        """
++        Calculate loss with diversity penalty.
++        
++        Args:
++            pred: Predicted ratings
++            target: True ratings
++            item_ids: Movie IDs for the batch
++            
++        Returns:
++            Combined loss value
++        """
++        # Base prediction loss
++        base_loss = self.base_criterion(pred, target)
++        
++        # Calculate per-item statistics
++        unique_items, inverse_indices, counts = torch.unique(
++            item_ids, 
++            return_inverse=True,
++            return_counts=True
++        )
++        
++        # Get per-item average predictions
++        item_predictions = torch.zeros(
++            len(unique_items), 
++            device=pred.device
++        ).scatter_add_(
++            0, 
++            inverse_indices, 
++            pred
++        ) / counts.float()
++        
++        # Diversity loss: penalize predictions that are too similar
++        pred_std = torch.std(item_predictions)
++        diversity_loss = torch.exp(-pred_std)  # Exponential penalty for low diversity
++        
++        # Rating distribution loss: encourage using full rating range
++        rating_range = torch.max(pred) - torch.min(pred)
++        rating_loss = torch.exp(-rating_range)  # Penalize narrow rating ranges
++        
++        # Combine losses
++        total_loss = (
++            base_loss + 
++            self.diversity_lambda * diversity_loss +
++            self.rating_lambda * rating_loss
++        )
++        
++        return total_loss
+ 
+ class HybridRecommender(BaseModel):
+     """Hybrid recommender system combining collaborative filtering with LLM features."""
+@@ -157,21 +293,29 @@ class HybridRecommender(BaseModel):
+     def __init__(self, config: HybridConfig):
+         """Initialize the hybrid recommender."""
+         super().__init__(config)
++        self.l2_lambda = config.l2_reg  # L2 regularization strength
+         
+-        # Initialize neural network
++        # Initialize neural network with stronger regularization
+         self.model = HybridNet(
+             n_users=config.n_users,
+             n_items=config.n_items,
+             n_factors=config.n_factors,
+             llm_dim=config.llm_embedding_dim,
+-            dropout=config.dropout
++            dropout=0.5  # Increased dropout
+         ).to(self.device)
+         
+-        # Initialize optimizer
++        # Initialize optimizer with higher learning rate and weight decay
+         self.optimizer = torch.optim.AdamW(
+             self.model.parameters(),
+-            lr=config.learning_rate,
+-            weight_decay=config.weight_decay
++            lr=2e-4,  # Increased learning rate
++            weight_decay=0.02  # Stronger weight decay
++        )
++        
++        # Learning rate scheduler
++        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
++            self.optimizer,
++            T_max=10,  # Number of epochs
++            eta_min=1e-6
+         )
+         
+         # Initialize feature extractor
+@@ -180,10 +324,15 @@ class HybridRecommender(BaseModel):
+             embedding_dim=config.llm_embedding_dim,
+             device=config.device
+         )
+-        
++
+         # Initialize loss function
+-        self.criterion = nn.MSELoss()
++        self.criterion = DiversityAwareLoss(
++            diversity_lambda=0.1,
++            rating_lambda=0.2
++        ).to(self.device)
+         
++        
++
+         # Initialize mixed precision scaler
+         self.scaler = torch.amp.GradScaler(self.device)
+         
+@@ -196,7 +345,16 @@ class HybridRecommender(BaseModel):
+         # Training history and state
+         self.history = []
+         self.steps = 0
+-        self.accumulation_steps = 4  # Gradient accumulation steps
++        self.accumulation_steps = 4
++    
++    def _compute_l2_loss(self):
++        """Calculate L2 regularization loss for model parameters."""
++        l2_loss = 0.0
++        for name, param in self.model.named_parameters():
++            if 'weight' in name:  # Only apply to weights, not biases
++                l2_loss += torch.norm(param, p=2)
++        return l2_loss
++
+     
+     async def _get_batch_llm_features(self,
+                                     users: torch.Tensor,
+@@ -246,27 +404,24 @@ class HybridRecommender(BaseModel):
+             torch.stack(user_results).to(self.device),
+             torch.stack(item_results).to(self.device)
+         )
+-    
++
+     async def train_step(self,
+                         batch: Dict[str, torch.Tensor],
+                         movie_info_dict: Dict,
+                         user_history_dict: Dict,
+                         user_tags_dict: Optional[Dict] = None,
+                         movie_tags_dict: Optional[Dict] = None) -> float:
+-        """Perform a single training step with mixed precision and gradient accumulation."""
+-        # Move data to device
++        """Enhanced training step with diversity-aware loss."""
+         user_ids = batch['user_id'].to(self.device)
+         item_ids = batch['item_id'].to(self.device)
+         ratings = batch['rating'].to(self.device)
+         
+-        # Get LLM features
+         user_llm_embeds, item_llm_embeds = await self._get_batch_llm_features(
+             user_ids, item_ids,
+             movie_info_dict, user_history_dict,
+             user_tags_dict, movie_tags_dict
+         )
+         
+-        # Mixed precision forward pass
+         with torch.amp.autocast(self.device.type):
+             predictions = self.model(
+                 user_ids,
+@@ -274,22 +429,33 @@ class HybridRecommender(BaseModel):
+                 user_llm_embeds,
+                 item_llm_embeds
+             )
+-            loss = self.criterion(predictions, ratings)
+-            loss = loss / self.accumulation_steps  # Scale loss for accumulation
++            
++            # Calculate loss with diversity consideration
++            pred_loss = self.criterion(predictions, ratings, item_ids)
++            
++            # Add L2 regularization loss
++            l2_loss = self._compute_l2_loss()
++            total_loss = pred_loss + self.l2_lambda * l2_loss
++            
++            # Scale loss for accumulation
++            total_loss = total_loss / self.accumulation_steps
+         
+         # Backward pass with gradient scaling
+-        self.scaler.scale(loss).backward()
++        self.scaler.scale(total_loss).backward()
+         
+-        # Update weights if accumulation is complete
+-        self.steps += 1
+         if self.steps % self.accumulation_steps == 0:
+             self.scaler.unscale_(self.optimizer)
+-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
++            torch.nn.utils.clip_grad_norm_(
++                self.model.parameters(), 
++                self.config.max_grad_norm
++            )
+             self.scaler.step(self.optimizer)
+             self.scaler.update()
+             self.optimizer.zero_grad()
+         
+-        return loss.item() * self.accumulation_steps  # Return unscaled loss
++        self.steps += 1
++        return total_loss.item() * self.accumulation_steps
++
+     
+     async def validate(self,
+                     dataloader: torch.utils.data.DataLoader,
+@@ -301,11 +467,10 @@ class HybridRecommender(BaseModel):
+         all_predictions = []
+         all_targets = []
+         
+-        # Clear GPU cache before validation
+         if torch.cuda.is_available():
+             torch.cuda.empty_cache()
+         
+-        with torch.no_grad(), torch.cuda.amp.autocast():
++        with torch.no_grad(), torch.amp.autocast(self.device.type):
+             progress_bar = tqdm(dataloader, 
+                             desc="Validation batches",
+                             leave=False,
+@@ -330,7 +495,8 @@ class HybridRecommender(BaseModel):
+                     item_llm_embeds
+                 )
+                 
+-                loss = self.criterion(predictions, ratings)
++                # Use only base MSE loss for validation
++                loss = F.mse_loss(predictions, ratings)
+                 total_loss += loss.item()
+                 
+                 all_predictions.extend(predictions.cpu().numpy())
+@@ -338,7 +504,6 @@ class HybridRecommender(BaseModel):
+                 
+                 progress_bar.set_description(f"Validation (loss: {loss.item():.4f})")
+         
+-        # Calculate metrics
+         all_predictions = np.array(all_predictions)
+         all_targets = np.array(all_targets)
+         
+@@ -360,14 +525,13 @@ class HybridRecommender(BaseModel):
+     async def fit(self,
+                 train_data: Dict,
+                 valid_data: Optional[Dict] = None) -> Dict[str, float]:
+-        """Train the model."""
+-        # Set model to training mode at epoch start
++        """Train the model with epoch-level scheduler step."""
+         self.model.train()
+         
+         epoch_loss = 0
++        running_l2 = 0
+         n_batches = len(train_data['dataloader'])
+         
+-        # Train loop
+         progress_bar = tqdm(enumerate(train_data['dataloader']), 
+                         total=n_batches,
+                         desc="Training batches",
+@@ -384,13 +548,34 @@ class HybridRecommender(BaseModel):
+             )
+             epoch_loss += loss
+             
+-            # Update progress bar
+-            progress_bar.set_description(f"Training (loss: {loss:.4f})")
++            # Calculate L2 norm for monitoring
++            l2_norm = self._compute_l2_loss().item()
++            running_l2 += l2_norm
++            
++            current_lr = self.scheduler.get_last_lr()[0]
++            
++            # Update progress bar with detailed info
++            progress_bar.set_description(
++                f"Training (loss: {loss:.4f}, L2: {l2_norm:.4f}, lr: {current_lr:.6f})"
++            )
+         
+-        metrics = {'train_loss': epoch_loss / n_batches}
++        # Step the scheduler once per epoch
++        self.scheduler.step()
++        
++        metrics = {
++            'train_loss': epoch_loss / n_batches,
++            'l2_norm': running_l2 / n_batches,
++            'learning_rate': self.scheduler.get_last_lr()[0]
++        }
+ 
+         self.logger.info(f"Epoch: {len(self.history) + 1}")
+         self.logger.info(f"Epoch training loss: {metrics['train_loss']:.4f}")
++        self.logger.info(f"Average L2 norm: {metrics['l2_norm']:.4f}")
++        self.logger.info(f"Learning rate: {metrics['learning_rate']:.6f}")
++
++        # Save model after each epoch at neam checkpoint_epoch.pt
++        self.save(Path(self.config.output_dir) / f"checkpoint_{len(self.history)}.pt")
++        
+         
+         if valid_data:
+             self.logger.info("Starting validation...")
+@@ -399,12 +584,10 @@ class HybridRecommender(BaseModel):
+                 valid_data['movie_info_dict'],
+                 valid_data['user_history_dict']
+             )
+-            self.logger.info(f"Validation metrics: {val_metrics}")
+             metrics.update(val_metrics)
+         
+         self.history.append(metrics)
+         return metrics
+-    
+     async def predict(self,
+                      user_ids: torch.Tensor,
+                      item_ids: torch.Tensor,
+@@ -543,7 +726,7 @@ class HybridRecommender(BaseModel):
+                                      user_history_dict: Dict) -> str:
+         """Generate an explanation for why a movie was recommended to a user."""
+         self.model.eval()
+-        with torch.no_grad(), torch.cuda.amp.autocast():
++        with torch.no_grad(), torch.amp.autocast(self.device.type):
+             # Get cached embeddings if available
+             user_embedding = self.feature_cache.get(f"user_{user_id}")
+             movie_embedding = self.feature_cache.get(f"movie_{movie_id}")

@@ -78,6 +78,8 @@ The project includes the Food.com dataset with:
    ```bash
    docker-compose exec dev bash
    python main.py train --data-dir data/processed --output-dir models --config-path src/configs/model_config.yaml
+
+   python main.py train --data-dir data/processed_high --output-dir models/high --config-path src/configs/model_config.yaml
    ```
 
 ## Evaluate
