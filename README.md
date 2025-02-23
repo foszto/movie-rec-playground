@@ -94,9 +94,15 @@ docker-compose up -d
    ```
 
 4. Stop the services:
+
    ```bash
    docker-compose down
    ```
+
+5. Raw data
+
+- Download the dataset and copy to data/raw/ directory
+- Link to MovieLens Dataset https://grouplens.org/datasets/movielens/25m/
 
 ## Data Pipeline
 
