@@ -46,4 +46,10 @@ Thumbs.db
 
 # Logs
 logs/
-*.log
+*.logdata/processed_high/*.parquet
+data/processed_high/*.pkl
+data/processed_high/*.pt
+models/**/*.pt
+models/**/*.csv
+output/*.csv
+output/*.pt
