@@ -141,6 +141,8 @@ Options:
 - `--output-dir`: Directory to save model and results (required)
 - `--config-path`: Path to model configuration file (required)
 
+The learning and validation phase of the first Epoch also starts slowly, gradually speeding up as the cache builds up, with speed increases of up to 1000x depending on hardware
+
 ### 3. Evaluation
 
 Evaluate the trained model:
